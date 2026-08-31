@@ -1,7 +1,8 @@
 # zfsbackup-rs
 
-Back up `zfs send` streams to any S3-compatible object store. One static
-binary, no server, no daemon, no database — the bucket is the source of truth.
+Back up `zfs send` streams to any S3-compatible object store. A single
+static binary that treats the bucket as the entire database — every command
+works from object storage alone.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -12,9 +13,8 @@ binary, no server, no daemon, no database — the bucket is the source of truth.
 
 ## Why
 
-Most direct-to-S3 ZFS backup tools treat integrity as something the restore
-will sort out. This one is built the other way around: a backup you cannot
-prove intact is not a backup.
+Integrity comes first: every byte is verified on its way in, provable at
+rest, and verified again on its way out.
 
 - **Verified at every hop.**
   1. While reading: every record's fletcher4 checksum in the `zfs send`
@@ -27,18 +27,17 @@ prove intact is not a backup.
   4. On restore: every chunk is BLAKE3-checked before a byte reaches
      `zfs receive`, and ZFS then re-verifies its own stream checksums.
 - **`verify` without ZFS.** Re-download and re-hash any backup from any
-  machine with the credentials. Put it in cron; find bit rot before the day
-  you need the restore, not on it.
-- **Retention that cannot break a chain.** Expire by age and count; a full
-  is never deleted while an incremental depends on it, directly or
-  transitively. Pins exempt a snapshot (and, through the rules, its
-  ancestry) entirely.
+  machine with the credentials. Put it in cron and find bit rot
+  early, while a restore is still a drill.
+- **Chain-safe retention.** Expire by age and count; a full stays until
+  every incremental that depends on it, directly or transitively, is gone.
+  Pins exempt a snapshot and, through the rules, its whole ancestry.
 - **Crash-safe by construction.** The manifest is written last, so an
-  interrupted backup is invisible rather than half-listed; retention deletes
-  the manifest first, so a listed backup never has missing chunks. An
-  interrupted send resumes past chunks already uploaded.
-- **No staging.** Chunks stream from the `zfs send` pipe to the store; your
-  data is never copied to local disk on the way out.
+  interrupted backup stays invisible; retention deletes the manifest first,
+  so every listed backup has all of its chunks. An interrupted send resumes
+  past chunks already uploaded.
+- **Zero staging.** Chunks stream straight from the `zfs send` pipe to the
+  store, keeping local disk out of the data path.
 - **Incrementals that survive snapshot rotation.** After each send the tool
   leaves a bookmark; the base snapshot can be destroyed and future
   incrementals still work.
@@ -103,9 +102,10 @@ zb/v1/pins/<snapshot-guid>
 ```
 
 Keys are GUID-based, so renaming a dataset never orphans its history; human
-names live inside the manifests. Everything the tool knows is derivable from
-the bucket — there is no local state to lose. Encrypted datasets are sent
-`--raw` automatically (ciphertext leaves the host; keys do not).
+names live inside the manifests. Everything the tool knows is
+derivable from the bucket: copy the bucket and you have copied the whole
+backup system. Encrypted datasets are sent `--raw` automatically, so only
+ciphertext ever leaves the host.
 
 ## Requirements
 
