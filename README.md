@@ -38,3 +38,10 @@ zfsbackup-rs retention s3://my-backups --keep-last 30 --older-than 90d
 ## License
 
 MIT or Apache-2.0, at your option.
+
+## Roadmap
+
+- Cheap remote audit: check stored CRC32C via `GetObjectAttributes` without
+  downloading (today `verify` re-downloads everything, which is the strongest
+  check but costs egress).
+- Prune ported-but-unused engine code; CI; static release binaries.
