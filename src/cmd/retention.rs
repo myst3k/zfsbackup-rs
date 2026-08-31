@@ -139,18 +139,41 @@ fn keep_set(
 }
 
 /// "90d", "12w", "24h", "30m".
+///
+/// A century is the ceiling: `Duration::days` itself panics on values near
+/// `i64::MAX`, and a mistyped extra digit should be a message, not a crash.
+const MAX_AGE_DAYS: i64 = 36_500;
+
 fn parse_age(s: &str) -> anyhow::Result<Duration> {
     let t = s.trim();
-    let (num, unit) = t.split_at(t.len().saturating_sub(1));
+    // Split on the last *character*, not the last byte: `90д` would otherwise
+    // land inside a multi-byte character and panic.
+    let (num, unit) = match t.char_indices().next_back() {
+        Some((i, c)) => (&t[..i], c),
+        None => bail!("empty age: expected e.g. 90d, 12w, 24h"),
+    };
     let n: i64 = num
         .parse()
         .map_err(|e| anyhow::anyhow!("{s:?}: expected e.g. 90d, 12w, 24h: {e}"))?;
-    Ok(match unit {
-        "d" => Duration::days(n),
-        "w" => Duration::weeks(n),
-        "h" => Duration::hours(n),
-        "m" => Duration::minutes(n),
+    if n < 0 {
+        bail!("{s:?}: age cannot be negative");
+    }
+    let days_equivalent = match unit {
+        'd' => n,
+        'w' => n.saturating_mul(7),
+        'h' => n / 24,
+        'm' => n / (24 * 60),
         _ => bail!("{s:?}: unit must be one of d, w, h, m"),
+    };
+    if days_equivalent > MAX_AGE_DAYS {
+        bail!("{s:?}: age is longer than {MAX_AGE_DAYS} days");
+    }
+    Ok(match unit {
+        'd' => Duration::days(n),
+        'w' => Duration::weeks(n),
+        'h' => Duration::hours(n),
+        'm' => Duration::minutes(n),
+        _ => unreachable!("unit validated above"),
     })
 }
 
@@ -165,6 +188,13 @@ mod tests {
         assert_eq!(parse_age("24h").unwrap(), time::Duration::hours(24));
         assert!(parse_age("90x").is_err());
         assert!(parse_age("d").is_err());
+        assert!(parse_age("").is_err());
+        // Errors instead of panicking: multi-byte suffix, absurd magnitude,
+        // and a negative value all reach the user as messages.
+        assert!(parse_age("90д").is_err());
+        assert!(parse_age("9999999d").is_err());
+        assert!(parse_age("-5d").is_err());
+        assert!(parse_age(&format!("{}d", i64::MAX)).is_err());
     }
 
     /// `ds` dataset, snapshot `guid`, optional base, archived `age_days` ago.

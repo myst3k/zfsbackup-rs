@@ -65,8 +65,12 @@ pub fn target(uri: &str, endpoint: Option<&str>, region: Option<&str>) -> anyhow
 }
 
 impl Target {
-    /// Every manifest in the bucket, decoded. Undecodable manifests are
-    /// reported and skipped — one corrupt object must not hide the rest.
+    /// Every manifest in the bucket, decoded.
+    ///
+    /// A manifest that cannot be read fails the command. Skipping it would
+    /// make an archived backup disappear from `list`, `verify` and the chain
+    /// walk while every command still reported success — and would let
+    /// `retention` reason about chains it cannot see.
     pub async fn manifests(&self) -> anyhow::Result<Vec<Manifest>> {
         let mut out = Vec::new();
         for (key, _) in self
@@ -78,10 +82,11 @@ impl Target {
                 continue;
             }
             let bytes = self.store.get(&key).await?;
-            match Manifest::decode(&bytes) {
-                Ok(m) => out.push(m),
-                Err(e) => eprintln!("warning: {key}: undecodable manifest, skipping: {e}"),
-            }
+            let m = Manifest::decode(&bytes)
+                .map_err(|e| anyhow::anyhow!("{key}: manifest is unreadable: {e}"))?;
+            m.check_version()
+                .map_err(|e| anyhow::anyhow!("{key}: {e}"))?;
+            out.push(m);
         }
         // Datasets together, then oldest first within each.
         out.sort_by(|a, b| {

@@ -33,8 +33,12 @@ pub async fn run(
         .find(|m| m.snapshot_guid == tip_guid)
         .context("selected manifest vanished between listings")?;
 
-    // Walk from_guid links back to the full.
+    // Walk from_guid links back to the full. `seen` guards against a cycle
+    // in hand-edited or corrupted manifests, which would otherwise loop
+    // forever building an unbounded chain.
     let mut chain: Vec<&Manifest> = vec![tip];
+    let mut seen: std::collections::HashSet<crate::types::Guid> =
+        std::iter::once(tip.snapshot_guid).collect();
     let mut cur = tip;
     while let Some(from) = cur.from_guid {
         let base = all
@@ -46,6 +50,14 @@ pub async fn run(
                     cur.snapshot
                 )
             })?;
+        if !seen.insert(from) {
+            bail!(
+                "chain of {} is circular at {} ({}); the manifests are inconsistent",
+                snapshot,
+                base.snapshot,
+                from
+            );
+        }
         chain.push(base);
         cur = base;
     }
@@ -102,7 +114,14 @@ async fn apply(
             let want = c.blake3.clone();
             let bytes = c.bytes;
             async move {
-                let data = store.get(&key).await?;
+                // Retried: a transient 5xx partway through a long restore
+                // would otherwise discard everything applied so far.
+                let data = super::retry("fetch chunk", || {
+                    let store = store.clone();
+                    let key = key.clone();
+                    async move { Ok(store.get(&key).await?) }
+                })
+                .await?;
                 if data.len() as u64 != bytes {
                     bail!(
                         "{key}: {} bytes in store, manifest says {bytes}",
@@ -119,7 +138,16 @@ async fn apply(
         futures::pin_mut!(fetches);
         while let Some(data) = fetches.next().await {
             let data = data?;
-            stdin.write_all(&data).await?;
+            // A write failure means zfs exited; collecting the child gives
+            // its stderr ("destination already exists", …), which says far
+            // more than the resulting broken pipe.
+            if let Err(pipe) = stdin.write_all(&data).await {
+                drop(stdin);
+                return match proc.finish().await {
+                    Err(zfs_err) => Err(anyhow::Error::new(zfs_err).context("zfs receive failed")),
+                    Ok(()) => Err(anyhow::Error::new(pipe).context("writing to zfs receive")),
+                };
+            }
             *total += data.len() as u64;
         }
         stdin.flush().await?;

@@ -35,10 +35,18 @@ pub struct Args {
 
 const JOB: &str = "default";
 const MIN_CHUNK: u64 = 5 << 20;
+/// S3 rejects a single PutObject above 5 GiB, and the chunk is held in
+/// memory before it goes out.
+const MAX_CHUNK: u64 = 5 << 30;
+/// How often the in-progress marker's lease is renewed while uploading.
+const LEASE_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub async fn run(a: Args) -> anyhow::Result<()> {
     if a.chunk_size < MIN_CHUNK {
         bail!("chunk size must be at least 5MiB");
+    }
+    if a.chunk_size > MAX_CHUNK {
+        bail!("chunk size must be at most 5GiB (a chunk is one PutObject, held in memory)");
     }
     let t = target(&a.uri, a.endpoint.as_deref(), a.region.as_deref())?;
     let zfs = Zfs::new().with_binary(&a.zfs_bin);
@@ -95,17 +103,12 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // strand it — blocking `zfs destroy` on that snapshot forever.
     zfs.hold(&tags::hold(JOB), &a.snapshot).await?;
 
-    let result = send_stream(
-        &t,
-        &zfs,
-        &a,
-        &snap.dataset,
-        snap.guid,
-        from_name.clone(),
-        from_guid,
-        flags,
-    )
-    .await;
+    // A signal ends the upload through the same path as an error, so the
+    // hold below is always released.
+    let result = tokio::select! {
+        r = send_stream(&t, &zfs, &a, &snap.dataset, snap.guid, from_name.clone(), from_guid, flags) => r,
+        how = interrupted() => Err(anyhow::anyhow!("{how}; the partial upload can be resumed by re-running")),
+    };
 
     // The hold's job is done once the stream is fully uploaded (or failed).
     if let Err(e) = zfs.release(&tags::hold(JOB), &a.snapshot).await {
@@ -205,10 +208,12 @@ async fn send_stream(
     // producing this same stream; a different base would leave unrelated
     // bytes under the right names, so those chunks are cleared instead.
     let marker_key = keys::pending(&t.prefix, ds_guid, snap_guid);
-    let want = Pending {
+    let mut mine = Pending {
         from_guid,
         send_flags: flags,
         chunk_size: a.chunk_size,
+        run_id: uuid::Uuid::now_v7(),
+        refreshed_at: time::OffsetDateTime::now_utc(),
     };
     let previous = match t.store.get(&marker_key).await {
         Ok(b) => Some(b),
@@ -216,10 +221,30 @@ async fn send_stream(
         Err(e) => return Err(e.into()),
     };
     let resume = match previous.as_deref().map(Pending::decode) {
-        Some(Ok(p)) if p == want => true,
-        Some(Ok(_)) => {
-            println!("previous attempt used different send parameters; starting this one clean");
-            false
+        Some(Ok(p)) => {
+            // A marker whose lease is still live belongs to a run that is
+            // very likely still uploading. Two runs sharing these keys can
+            // commit a manifest describing the other's bytes, so this one
+            // steps aside instead of touching anything.
+            if p.lease_live(time::OffsetDateTime::now_utc()) && p.run_id != mine.run_id {
+                bail!(
+                    "another send of {} is in progress (run {}, last seen {}); \
+                     wait for it, or delete {marker_key} if you know it is dead",
+                    a.snapshot,
+                    p.run_id,
+                    p.refreshed_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| p.refreshed_at.to_string())
+                );
+            }
+            if p.same_stream(&mine) {
+                true
+            } else {
+                println!(
+                    "previous attempt used different send parameters; starting this one clean"
+                );
+                false
+            }
         }
         Some(Err(e)) => {
             tracing::warn!(error = %e, "unreadable resume marker; starting clean");
@@ -232,13 +257,8 @@ async fn send_stream(
         tracing::info!(objects, uploads, "cleared chunks from an unrelated attempt");
         existing.clear();
     }
-    let marker = Bytes::from(want.encode()?);
-    retry("write resume marker", || {
-        let body = marker.clone();
-        let key = marker_key.clone();
-        async move { Ok(t.store.put(&key, body).await?) }
-    })
-    .await?;
+    write_marker(t, &marker_key, &mine).await?;
+    let mut refreshed = Instant::now();
 
     let mut proc = zfs
         .send(&SendSpec {
@@ -279,6 +299,13 @@ async fn send_stream(
                 end_checksum = Some(hex::encode(e.checksum.to_bytes()));
             }
         }
+        // Keep the lease alive so a concurrent run can tell this one apart
+        // from a crashed one.
+        if refreshed.elapsed() >= LEASE_REFRESH {
+            mine.refreshed_at = time::OffsetDateTime::now_utc();
+            write_marker(t, &marker_key, &mine).await?;
+            refreshed = Instant::now();
+        }
         stream_hash.update_rayon(&buf);
         let blake3 = blake3::hash(&buf).to_hex().to_string();
         let bytes = buf.len() as u64;
@@ -315,8 +342,11 @@ async fn send_stream(
     while let Some(r) = inflight.join_next().await {
         uploaded.insert(r??);
     }
-    parser.finish()?;
+    // Collect the child first: when `zfs send` dies mid-stream its stderr
+    // says why (faulted pool, destroyed base), which is more useful than the
+    // truncation the parser would report from the same event.
     proc.wait().await?;
+    parser.finish()?;
     if uploaded.len() != chunks.len() {
         bail!(
             "uploaded {} of {} chunks — refusing to write the manifest",
@@ -331,6 +361,44 @@ async fn send_stream(
         end_checksum,
         started.elapsed().as_secs_f64(),
     ))
+}
+
+async fn write_marker(t: &Target, key: &str, p: &Pending) -> anyhow::Result<()> {
+    let body = Bytes::from(p.encode()?);
+    retry("write resume marker", || {
+        let body = body.clone();
+        let key = key.to_string();
+        async move { Ok(t.store.put(&key, body).await?) }
+    })
+    .await
+}
+
+/// Resolves when the process is asked to stop, so the snapshot's hold can be
+/// released before exiting. Without this a Ctrl-C leaves `zb:default` on the
+/// snapshot and every later `zfs destroy` of it fails with "dataset is busy".
+async fn interrupted() -> &'static str {
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "no SIGTERM handler; only Ctrl-C will release the hold");
+                let _ = tokio::signal::ctrl_c().await;
+                return "interrupted";
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "interrupted",
+            _ = term.recv() => "terminated",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "interrupted"
+    }
 }
 
 /// The GUID of an explicit `--from` (snapshot `@s` / `pool/ds@s`, or

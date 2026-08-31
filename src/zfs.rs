@@ -230,7 +230,8 @@ impl Zfs {
         }
         Ok(Dataset {
             name: name.to_string(),
-            guid: v[0].parse().map_err(|_| ZfsError::Parse {
+            // ZFS prints GUIDs in decimal; the hex form is ours alone.
+            guid: Guid::from_zfs(v[0]).map_err(|_| ZfsError::Parse {
                 args: "get guid".into(),
                 line: v[0].into(),
             })?,
@@ -276,7 +277,7 @@ impl Zfs {
                 name: f[0].to_string(),
                 dataset: ds.to_string(),
                 snapname: snap.to_string(),
-                guid: f[1].parse().map_err(|_| parse_err())?,
+                guid: Guid::from_zfs(f[1]).map_err(|_| parse_err())?,
                 createtxg: f[2].parse().map_err(|_| parse_err())?,
                 creation: f[3].parse().map_err(|_| parse_err())?,
                 referenced: f[4].parse().map_err(|_| parse_err())?,
@@ -323,7 +324,7 @@ impl Zfs {
             }
             v.push(Bookmark {
                 name: f[0].to_string(),
-                guid: f[1].parse().map_err(|_| parse_err())?,
+                guid: Guid::from_zfs(f[1]).map_err(|_| parse_err())?,
                 createtxg: f[2].parse().map_err(|_| parse_err())?,
             });
         }
@@ -496,6 +497,18 @@ impl Zfs {
             cmd: format!("zfs {}", args.join(" ")),
             source: std::io::Error::other("stdin pipe not attached"),
         })?;
+        // stdout is drained like stderr: an unread pipe stalls the child once
+        // the kernel buffer fills, which would hang the restore with no output.
+        if let Some(mut out) = child.stdout.take() {
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                match out.read_to_string(&mut buf).await {
+                    Ok(_) if !buf.trim().is_empty() => debug!(output = %buf.trim(), "zfs receive"),
+                    Ok(_) => {}
+                    Err(e) => debug!(error = %e, "reading zfs receive stdout"),
+                }
+            });
+        }
         Ok(ReceiveProcess {
             child,
             stdin: Some(stdin),

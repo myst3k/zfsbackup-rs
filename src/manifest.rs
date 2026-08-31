@@ -53,14 +53,37 @@ pub struct Manifest {
 /// commits. It records everything that determines the stream's bytes, so an
 /// interrupted run can only resume when the next run would produce the same
 /// stream; anything else starts clean.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
     pub from_guid: Option<Guid>,
     pub send_flags: SendFlags,
     pub chunk_size: u64,
+    /// Identifies the run that owns this attempt.
+    pub run_id: uuid::Uuid,
+    /// Refreshed while the run is uploading. A marker whose lease has not
+    /// expired means another send of this snapshot is still alive, and this
+    /// one must not touch its chunks.
+    #[serde(with = "time::serde::rfc3339")]
+    pub refreshed_at: OffsetDateTime,
 }
 
+/// How long a marker stays authoritative after its last refresh. Long enough
+/// to cover a stalled network call, short enough that a crashed run does not
+/// block the next attempt for long.
+pub const LEASE: time::Duration = time::Duration::minutes(5);
+
 impl Pending {
+    /// Same stream? (Ownership and freshness are separate questions.)
+    pub fn same_stream(&self, other: &Pending) -> bool {
+        self.from_guid == other.from_guid
+            && self.send_flags == other.send_flags
+            && self.chunk_size == other.chunk_size
+    }
+
+    pub fn lease_live(&self, now: OffsetDateTime) -> bool {
+        now - self.refreshed_at < LEASE
+    }
+
     pub fn encode(&self) -> serde_json::Result<Vec<u8>> {
         serde_json::to_vec(self)
     }
@@ -83,6 +106,19 @@ pub struct Chunk {
 impl Manifest {
     pub fn is_full(&self) -> bool {
         self.from_guid.is_none()
+    }
+
+    /// Refuse a manifest written by a format this binary does not implement,
+    /// rather than interpreting its fields under v1 rules.
+    pub fn check_version(&self) -> Result<(), String> {
+        if self.format_version == FORMAT_VERSION {
+            Ok(())
+        } else {
+            Err(format!(
+                "manifest format version {} (this build understands {FORMAT_VERSION}); upgrade zfsbackup-rs",
+                self.format_version
+            ))
+        }
     }
 
     pub fn encode(&self) -> serde_json::Result<Vec<u8>> {

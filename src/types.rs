@@ -25,15 +25,34 @@ impl fmt::Debug for Guid {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0:?} is not a GUID in 16 hex digits")]
+pub struct ParseGuidError(String);
+
+impl Guid {
+    /// Parse the decimal form ZFS prints (`zfs list -Hp -o guid`).
+    ///
+    /// Kept separate from [`FromStr`] on purpose: a decimal GUID of exactly
+    /// 16 digits is also a valid hex string, so one parser that guessed
+    /// between the two would silently decode ~1 in 2000 GUIDs as a different
+    /// number — and could map two distinct snapshots onto one identity.
+    pub fn from_zfs(s: &str) -> Result<Self, std::num::ParseIntError> {
+        s.trim().parse::<u64>().map(Guid)
+    }
+}
+
+/// The canonical 16-hex-digit form written by [`fmt::Display`], used in
+/// bucket keys and JSON.
 impl FromStr for Guid {
-    type Err = std::num::ParseIntError;
+    type Err = ParseGuidError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Accept both hex (our canonical form) and the decimal `zfs list` prints.
         if s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            u64::from_str_radix(s, 16).map(Guid)
+            u64::from_str_radix(s, 16)
+                .map(Guid)
+                .map_err(|_| ParseGuidError(s.to_string()))
         } else {
-            s.parse::<u64>().map(Guid)
+            Err(ParseGuidError(s.to_string()))
         }
     }
 }
@@ -105,10 +124,9 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     } else {
         (t, 1)
     };
-    num.trim()
-        .parse::<u64>()
-        .map(|v| v * mult)
-        .map_err(|e| format!("{s:?}: {e}"))
+    let v: u64 = num.trim().parse().map_err(|e| format!("{s:?}: {e}"))?;
+    v.checked_mul(mult)
+        .ok_or_else(|| format!("{s:?}: size is larger than u64"))
 }
 
 #[cfg(test)]
@@ -120,7 +138,32 @@ mod tests {
         let g = Guid(0xdead_beef_0000_0001);
         assert_eq!(g.to_string(), "deadbeef00000001");
         assert_eq!("deadbeef00000001".parse::<Guid>().unwrap(), g);
-        assert_eq!("12345".parse::<Guid>().unwrap(), Guid(12345));
+    }
+
+    /// A 16-digit decimal GUID is also a valid hex string. The two forms have
+    /// separate parsers so this one can never be read as the other: ZFS's
+    /// decimal 1234567890123456 and the hex GUID 1234567890123456 are
+    /// different snapshots and must stay different identities.
+    #[test]
+    fn decimal_and_hex_do_not_alias() {
+        let ambiguous = "1234567890123456";
+        assert_eq!(Guid::from_zfs(ambiguous).unwrap(), Guid(1234567890123456));
+        assert_eq!(ambiguous.parse::<Guid>().unwrap(), Guid(0x1234567890123456));
+        assert_ne!(
+            Guid::from_zfs(ambiguous).unwrap(),
+            ambiguous.parse::<Guid>().unwrap()
+        );
+    }
+
+    #[test]
+    fn zfs_guids_are_decimal() {
+        // Real values from `zfs list -Hp -o guid`.
+        assert_eq!(
+            Guid::from_zfs("1848502438638364855").unwrap(),
+            Guid(1848502438638364855)
+        );
+        // The canonical parser rejects them: they are not the 16-hex form.
+        assert!("1848502438638364855".parse::<Guid>().is_err());
     }
 
     #[test]
@@ -129,5 +172,8 @@ mod tests {
         assert_eq!(parse_size("5M").unwrap(), 5 << 20);
         assert_eq!(parse_size("123").unwrap(), 123);
         assert!(parse_size("x").is_err());
+        // Overflow reports instead of wrapping (release builds have no
+        // overflow checks, so this silently became 1 GiB before).
+        assert!(parse_size("17179869185G").is_err());
     }
 }
