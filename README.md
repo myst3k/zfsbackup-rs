@@ -95,6 +95,10 @@ or `AWS_ENDPOINT_URL`/`AWS_REGION`.
 
 ## How it is stored
 
+Keys are relative to the bucket (or to the prefix in
+`s3://bucket/prefix`): `zb/` namespaces everything the tool writes, so a
+bucket can hold other data alongside, and `v1/` versions the layout.
+
 ```text
 zb/v1/<dataset-guid>/<snapshot-guid>/manifest.json
 zb/v1/<dataset-guid>/<snapshot-guid>/chunk-000000 … chunk-NNNNNN
