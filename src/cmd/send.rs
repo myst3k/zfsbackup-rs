@@ -14,7 +14,7 @@ use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 
-use crate::manifest::{Chunk, FORMAT_VERSION, Manifest, keys};
+use crate::manifest::{Chunk, FORMAT_VERSION, Manifest, Pending, keys};
 use crate::stream::{Event, StreamParser};
 use crate::types::{Guid, SendFlags};
 use crate::zfs::{SendSpec, Zfs, tags};
@@ -48,6 +48,12 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     let manifests = t.manifests().await?;
     if let Some(m) = manifests.iter().find(|m| m.snapshot_guid == snap.guid) {
         println!("{} is already archived ({} bytes)", m.snapshot, m.bytes);
+        // The snapshot is safely stored, so any hold this tool left behind
+        // (an interrupted earlier run) has done its job and is dropped here;
+        // otherwise it would keep blocking `zfs destroy` on that snapshot.
+        if let Err(e) = zfs.release(&tags::hold(JOB), &a.snapshot).await {
+            tracing::warn!(error = %e, "could not release hold {}", tags::hold(JOB));
+        }
         return Ok(());
     }
 
@@ -83,8 +89,11 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         None => println!("full {}", a.snapshot),
     }
 
-    // Hold the snapshot while it is being read.
-    let held = zfs.hold(&tags::hold(JOB), &a.snapshot).await?;
+    // Hold the snapshot while it is being read. The tag belongs to this tool,
+    // so it is released below whether or not this run placed it: an earlier
+    // interrupted run leaves its hold behind, and skipping the release would
+    // strand it — blocking `zfs destroy` on that snapshot forever.
+    zfs.hold(&tags::hold(JOB), &a.snapshot).await?;
 
     let result = send_stream(
         &t,
@@ -93,13 +102,14 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         &snap.dataset,
         snap.guid,
         from_name.clone(),
+        from_guid,
         flags,
     )
     .await;
 
     // The hold's job is done once the stream is fully uploaded (or failed).
-    if held && let Err(e) = zfs.release(&tags::hold(JOB), &a.snapshot).await {
-        tracing::warn!(error = %e, "could not release hold {}", tags::hold(JOB));
+    if let Err(e) = zfs.release(&tags::hold(JOB), &a.snapshot).await {
+        tracing::warn!(error = %e, "could not release hold {}; `zfs release {} {}` clears it", tags::hold(JOB), tags::hold(JOB), a.snapshot);
     }
     let (chunks, bytes, stream_blake3, end_checksum, secs) = result?;
 
@@ -128,24 +138,38 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     })
     .await?;
 
+    // The send is committed; the resume marker has served its purpose.
+    if let Err(e) = t
+        .store
+        .delete(&keys::pending(&t.prefix, ds.guid, snap.guid))
+        .await
+    {
+        tracing::warn!(error = %e, "could not remove the resume marker (harmless; the next send overwrites it)");
+    }
+
     // A bookmark survives snapshot destruction, keeping future incrementals
     // possible; one zb bookmark per dataset, at the newest archived snapshot.
+    // Older bookmarks are pruned only once the new one exists, so a failed
+    // bookmark leaves the dataset with a usable base.
     let bm = tags::bookmark(JOB, &a.snapshot, snap.guid);
-    if let Err(e) = zfs.bookmark(&a.snapshot, &bm).await {
-        tracing::warn!(error = %e, "could not create bookmark {bm} (incrementals need the snapshot or bookmark to survive)");
-    }
-    match zfs.bookmarks(&snap.dataset).await {
-        Ok(marks) => {
-            for b in marks {
-                if let Some(g) = tags::bookmark_guid(JOB, &b.name)
-                    && g != snap.guid
-                    && let Err(e) = zfs.destroy_bookmark(&b.name).await
-                {
-                    tracing::warn!(error = %e, "could not remove old bookmark {}", b.name);
+    match zfs.bookmark(&a.snapshot, &bm).await {
+        Ok(()) => match zfs.bookmarks(&snap.dataset).await {
+            Ok(marks) => {
+                for b in marks {
+                    if let Some(g) = tags::bookmark_guid(JOB, &b.name)
+                        && g != snap.guid
+                        && let Err(e) = zfs.destroy_bookmark(&b.name).await
+                    {
+                        tracing::warn!(error = %e, "could not remove old bookmark {}", b.name);
+                    }
                 }
             }
-        }
-        Err(e) => tracing::warn!(error = %e, "could not list bookmarks for cleanup"),
+            Err(e) => tracing::warn!(error = %e, "could not list bookmarks for cleanup"),
+        },
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not create bookmark {bm}; keeping the previous one so incrementals still have a base"
+        ),
     }
 
     let mbs = bytes as f64 / secs / 1e6;
@@ -169,19 +193,52 @@ async fn send_stream(
     dataset: &str,
     snap_guid: Guid,
     from_name: Option<String>,
+    from_guid: Option<Guid>,
     flags: SendFlags,
 ) -> anyhow::Result<(Vec<Chunk>, u64, String, Option<String>, f64)> {
     let ds_guid = zfs.dataset(dataset).await?.guid;
-    // Chunks from an interrupted earlier run: same key, same size → skip.
-    let existing: BTreeMap<String, u64> = t
-        .store
-        .list(&format!(
-            "{}/",
-            keys::snapshot_dir(&t.prefix, ds_guid, snap_guid)
-        ))
-        .await?
-        .into_iter()
-        .collect();
+    let dir = format!("{}/", keys::snapshot_dir(&t.prefix, ds_guid, snap_guid));
+    let mut existing: BTreeMap<String, u64> = t.store.list(&dir).await?.into_iter().collect();
+
+    // Chunk keys depend only on the snapshot, while chunk contents depend on
+    // the base and the send flags. Resume only when the interrupted run was
+    // producing this same stream; a different base would leave unrelated
+    // bytes under the right names, so those chunks are cleared instead.
+    let marker_key = keys::pending(&t.prefix, ds_guid, snap_guid);
+    let want = Pending {
+        from_guid,
+        send_flags: flags,
+        chunk_size: a.chunk_size,
+    };
+    let previous = match t.store.get(&marker_key).await {
+        Ok(b) => Some(b),
+        Err(crate::store::StoreError::NotFound(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let resume = match previous.as_deref().map(Pending::decode) {
+        Some(Ok(p)) if p == want => true,
+        Some(Ok(_)) => {
+            println!("previous attempt used different send parameters; starting this one clean");
+            false
+        }
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "unreadable resume marker; starting clean");
+            false
+        }
+        None => false,
+    };
+    if !resume && !existing.is_empty() {
+        let (objects, uploads) = t.store.purge_prefix(&dir).await?;
+        tracing::info!(objects, uploads, "cleared chunks from an unrelated attempt");
+        existing.clear();
+    }
+    let marker = Bytes::from(want.encode()?);
+    retry("write resume marker", || {
+        let body = marker.clone();
+        let key = marker_key.clone();
+        async move { Ok(t.store.put(&key, body).await?) }
+    })
+    .await?;
 
     let mut proc = zfs
         .send(&SendSpec {
@@ -295,8 +352,14 @@ async fn resolve_base_guid(zfs: &Zfs, dataset: &str, from: &str) -> anyhow::Resu
     Ok(zfs.snapshot(&full).await?.guid)
 }
 
-/// Newest archived snapshot of this dataset (older than the one being sent)
-/// that still exists locally as a snapshot or zb bookmark.
+/// Most recently archived snapshot of this dataset that still exists locally
+/// as a snapshot or zb bookmark and precedes the one being sent.
+///
+/// Candidates are ordered by when they were archived, which stays comparable
+/// across pools; `createtxg` orders snapshots only within the pool that
+/// produced them, so a dataset restored onto a new pool mixes two scales.
+/// Local txgs still gate a candidate against the target, and zfs rejects any
+/// base that is not an ancestor.
 async fn auto_base(
     zfs: &Zfs,
     manifests: &[Manifest],
@@ -308,14 +371,20 @@ async fn auto_base(
     let local_marks = zfs.bookmarks(dataset).await?;
     let mut candidates: Vec<&Manifest> = manifests
         .iter()
-        .filter(|m| m.dataset_guid == ds_guid && m.createtxg < to_txg)
+        .filter(|m| m.dataset_guid == ds_guid)
         .collect();
-    candidates.sort_by_key(|m| std::cmp::Reverse(m.createtxg));
+    candidates.sort_by_key(|m| std::cmp::Reverse(m.created_at));
     for m in candidates {
-        if let Some(s) = local_snaps.iter().find(|s| s.guid == m.snapshot_guid) {
+        if let Some(s) = local_snaps
+            .iter()
+            .find(|s| s.guid == m.snapshot_guid && s.createtxg < to_txg)
+        {
             return Ok((Some(s.name.clone()), Some(m.snapshot_guid)));
         }
-        if let Some(b) = local_marks.iter().find(|b| b.guid == m.snapshot_guid) {
+        if let Some(b) = local_marks
+            .iter()
+            .find(|b| b.guid == m.snapshot_guid && b.createtxg < to_txg)
+        {
             return Ok((Some(b.name.clone()), Some(m.snapshot_guid)));
         }
     }

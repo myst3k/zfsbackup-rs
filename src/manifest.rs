@@ -49,6 +49,27 @@ pub struct Manifest {
     pub chunks: Vec<Chunk>,
 }
 
+/// Written before the first chunk of a send and deleted once the manifest
+/// commits. It records everything that determines the stream's bytes, so an
+/// interrupted run can only resume when the next run would produce the same
+/// stream; anything else starts clean.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    pub from_guid: Option<Guid>,
+    pub send_flags: SendFlags,
+    pub chunk_size: u64,
+}
+
+impl Pending {
+    pub fn encode(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(self)
+    }
+
+    pub fn decode(bytes: &[u8]) -> serde_json::Result<Self> {
+        serde_json::from_slice(bytes)
+    }
+}
+
 /// One chunk object. Chunks are `chunk_size`-sized slices of the raw stream,
 /// in order; the last one is short.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,6 +120,11 @@ pub mod keys {
 
     pub fn chunk(prefix: &str, dataset: Guid, snapshot: Guid, seq: u32) -> String {
         format!("{}/chunk-{seq:06}", snapshot_dir(prefix, dataset, snapshot))
+    }
+
+    /// In-progress marker for a send; see [`super::Pending`].
+    pub fn pending(prefix: &str, dataset: Guid, snapshot: Guid) -> String {
+        format!("{}/pending.json", snapshot_dir(prefix, dataset, snapshot))
     }
 
     pub fn all_manifests_prefix(prefix: &str) -> String {

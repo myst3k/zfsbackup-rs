@@ -49,7 +49,8 @@ enum Cmd {
         /// Chunk size, e.g. 64MiB (min 5MiB).
         #[arg(long, default_value = "64MiB")]
         chunk_size: String,
-        /// Chunks uploaded in parallel.
+        /// Chunks uploaded in parallel. Memory use is roughly
+        /// chunk-size × parallel.
         #[arg(long, default_value_t = 4)]
         parallel: usize,
     },
@@ -90,9 +91,10 @@ enum Cmd {
         /// Delete snapshots older than this (e.g. 90d, 12w). Chains stay intact.
         #[arg(long)]
         older_than: Option<String>,
-        /// Always keep the newest N snapshots per dataset.
-        #[arg(long, default_value_t = 1)]
-        keep_last: usize,
+        /// Keep the newest N snapshots per dataset and delete the rest.
+        /// Combined with --older-than, both are kept.
+        #[arg(long)]
+        keep_last: Option<usize>,
         /// Show what would be deleted without deleting.
         #[arg(long)]
         dry_run: bool,

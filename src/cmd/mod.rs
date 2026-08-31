@@ -95,10 +95,7 @@ impl Target {
     }
 
     pub async fn manifest_for(&self, snapshot: &str) -> anyhow::Result<Manifest> {
-        let all = self.manifests().await?;
-        all.into_iter()
-            .find(|m| m.snapshot == snapshot)
-            .with_context(|| format!("{snapshot} is not archived here (see `list`)"))
+        pick(self.manifests().await?, snapshot)
     }
 
     pub async fn pinned(&self) -> anyhow::Result<Vec<Guid>> {
@@ -114,7 +111,89 @@ impl Target {
     }
 }
 
+/// The one manifest with this snapshot name. Snapshot names repeat across
+/// datasets — two hosts sharing a bucket, or a dataset recreated under the
+/// same name — while GUIDs do not, so an ambiguous name is an error naming
+/// the candidates rather than a silent pick.
+pub fn pick(all: Vec<Manifest>, snapshot: &str) -> anyhow::Result<Manifest> {
+    let mut hits: Vec<Manifest> = all.into_iter().filter(|m| m.snapshot == snapshot).collect();
+    match hits.len() {
+        0 => bail!("{snapshot} is not archived here (see `list`)"),
+        1 => Ok(hits.remove(0)),
+        _ => {
+            let mut msg = format!("{snapshot} matches {} archived snapshots:\n", hits.len());
+            for m in &hits {
+                msg.push_str(&format!(
+                    "  dataset {} (guid {}), snapshot guid {}, {} bytes, {}\n",
+                    m.dataset,
+                    m.dataset_guid,
+                    m.snapshot_guid,
+                    m.bytes,
+                    m.created_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| m.created_at.to_string()),
+                ));
+            }
+            msg.push_str("give each host its own prefix (s3://bucket/<host>) to keep them apart");
+            bail!(msg)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick;
+    use crate::manifest::{FORMAT_VERSION, Manifest};
+    use crate::types::Guid;
+
+    fn m(ds: u64, snap: u64, name: &str) -> Manifest {
+        Manifest {
+            format_version: FORMAT_VERSION,
+            dataset: format!("tank/d{ds}"),
+            dataset_guid: Guid(ds),
+            snapshot: name.into(),
+            snapshot_guid: Guid(snap),
+            from_guid: None,
+            createtxg: 1,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            send_flags: Default::default(),
+            bytes: 0,
+            stream_blake3: String::new(),
+            end_checksum: None,
+            chunks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unique_name_resolves() {
+        let all = vec![m(1, 10, "tank/data@a"), m(1, 11, "tank/data@b")];
+        assert_eq!(pick(all, "tank/data@b").unwrap().snapshot_guid, Guid(11));
+    }
+
+    #[test]
+    fn missing_name_errors() {
+        assert!(pick(vec![m(1, 10, "tank/data@a")], "tank/data@z").is_err());
+    }
+
+    /// Two hosts backing up the same dataset name into one bucket: the tool
+    /// must refuse rather than guess which host's data is meant.
+    #[test]
+    fn ambiguous_name_errors_with_candidates() {
+        let all = vec![m(1, 10, "tank/data@daily"), m(2, 20, "tank/data@daily")];
+        let e = pick(all, "tank/data@daily").unwrap_err().to_string();
+        assert!(e.contains("matches 2"), "{e}");
+        assert!(
+            e.contains(&Guid(1).to_string()) && e.contains(&Guid(2).to_string()),
+            "{e}"
+        );
+    }
+}
+
 /// Retry a fallible upload/download step with capped exponential backoff.
+///
+/// Store errors that say what went wrong — bad credentials, a missing
+/// bucket, a rejected checksum — are returned immediately; retrying those
+/// only delays the message the operator needs.
 pub async fn retry<T, F, Fut>(what: &str, mut op: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
@@ -124,6 +203,12 @@ where
     loop {
         match op().await {
             Ok(v) => return Ok(v),
+            Err(e)
+                if e.downcast_ref::<crate::store::StoreError>()
+                    .is_some_and(|s| !s.is_retryable()) =>
+            {
+                return Err(e.context(format!("{what}: not retryable")));
+            }
             Err(e) if attempt < 6 => {
                 attempt += 1;
                 let wait = Duration::from_millis(300u64.saturating_mul(1 << attempt.min(5)));
