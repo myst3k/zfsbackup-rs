@@ -355,6 +355,40 @@ impl Admin {
             })
     }
 
+    /// PUT one object carrying `x-amz-checksum-crc32c`: the store verifies
+    /// the body server-side (BadDigest on mismatch) and echoes the checksum,
+    /// which we check too.
+    pub async fn put_object_crc32c(&self, key: &str, data: Bytes, crc: u32) -> Result<()> {
+        let want = crate::store::crc32c_b64(crc);
+        let (_, headers, _) = self
+            .call_unsigned(
+                "PutObject",
+                reqwest::Method::PUT,
+                Some(key),
+                "",
+                data,
+                &[
+                    ("x-amz-sdk-checksum-algorithm", "CRC32C".into()),
+                    ("x-amz-checksum-crc32c", want.clone()),
+                ],
+            )
+            .await?;
+        let echoed = headers
+            .get("x-amz-checksum-crc32c")
+            .and_then(|v| v.to_str().ok());
+        if echoed != Some(want.as_str()) {
+            return Err(AdminError::S3 {
+                op: "PutObject",
+                status: 200,
+                code: "ChecksumNotEchoed".into(),
+                message: format!(
+                    "store returned checksum {echoed:?}, sent {want}; target does not verify CRC32C"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// CompleteMultipartUpload listing each part's ETag and CRC32C.
     pub async fn complete_multipart_crc32c(
         &self,

@@ -20,8 +20,8 @@ use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::Guid;
 use crate::fletcher::Fletcher4;
+use crate::types::Guid;
 
 pub const RECORD_LEN: usize = 312;
 const CKSUM_OFF: usize = RECORD_LEN - 32;

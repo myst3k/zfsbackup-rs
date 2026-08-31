@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use crate::types::Guid;
 use crate::types::SendFlags;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};

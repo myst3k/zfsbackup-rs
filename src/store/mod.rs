@@ -13,6 +13,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::hash::Md5;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3Builder, Checksum};
@@ -22,7 +23,6 @@ use object_store::{
     ClientOptions, GetOptions, GetRange, MultipartId, ObjectStore, PutPayload, RetryConfig,
 };
 use serde::{Deserialize, Serialize};
-use crate::hash::Md5;
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -626,6 +626,20 @@ impl Store {
     // ---- whole objects ---------------------------------------------------
 
     #[instrument(skip(self, data), fields(store = %self.label, len = data.len()))]
+    /// PUT with `x-amz-checksum-crc32c` so the store verifies the body at
+    /// write time. Plain put for stores without the admin client (memory).
+    pub async fn put_verified(&self, key: &str, data: Bytes) -> Result<()> {
+        match (&self.admin, self.part_checksum) {
+            (Some(a), PartChecksum::Crc32c) => {
+                let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, &data) as u32;
+                a.put_object_crc32c(key, data, crc)
+                    .await
+                    .map_err(|e| admin_error(e, key, ""))
+            }
+            _ => self.put(key, data).await,
+        }
+    }
+
     pub async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         self.inner
             .put(&Self::path(key), PutPayload::from_bytes(data))

@@ -5,8 +5,10 @@
 //! record checksums while reading, BLAKE3 per chunk in the manifest, and
 //! CRC32C verified server-side on upload.
 
+mod cmd;
 mod fletcher;
 mod hash;
+mod manifest;
 mod store;
 mod stream;
 mod types;
@@ -116,9 +118,66 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(run(cli))
 }
 
-#[allow(unused_variables)]
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    let endpoint = cli.endpoint.as_deref();
+    let region = cli.region.as_deref();
     match cli.cmd {
-        _ => anyhow::bail!("not implemented yet"),
+        Cmd::Send {
+            snapshot,
+            uri,
+            from,
+            full,
+            chunk_size,
+            parallel,
+        } => {
+            cmd::send::run(cmd::send::Args {
+                snapshot,
+                uri,
+                from,
+                full,
+                chunk_size: types::parse_size(&chunk_size).map_err(anyhow::Error::msg)?,
+                parallel,
+                endpoint: cli.endpoint.clone(),
+                region: cli.region.clone(),
+                zfs_bin: cli.zfs.clone(),
+            })
+            .await
+        }
+        Cmd::Receive {
+            snapshot,
+            uri,
+            target,
+            force,
+            window,
+        } => {
+            cmd::receive::run(
+                &snapshot, &uri, &target, force, window, endpoint, region, &cli.zfs,
+            )
+            .await
+        }
+        Cmd::List { uri, dataset } => {
+            cmd::list::run(&uri, dataset.as_deref(), endpoint, region).await
+        }
+        Cmd::Verify { snapshot, uri } => cmd::verify::run(&snapshot, &uri, endpoint, region).await,
+        Cmd::Retention {
+            uri,
+            older_than,
+            keep_last,
+            dry_run,
+        } => {
+            cmd::retention::run(
+                &uri,
+                older_than.as_deref(),
+                keep_last,
+                dry_run,
+                endpoint,
+                region,
+            )
+            .await
+        }
+        Cmd::Pin { snapshot, uri } => cmd::pin::run(&snapshot, &uri, true, endpoint, region).await,
+        Cmd::Unpin { snapshot, uri } => {
+            cmd::pin::run(&snapshot, &uri, false, endpoint, region).await
+        }
     }
 }
