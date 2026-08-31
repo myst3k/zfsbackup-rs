@@ -28,10 +28,9 @@ pub async fn run(
             continue;
         }
         shown += 1;
-        let kind = if m.is_full() {
-            "full".to_string()
-        } else {
-            format!("incr←{}", m.from_guid.expect("incremental has a base"))
+        let kind = match m.from_guid {
+            None => "full".to_string(),
+            Some(base) => format!("incr←{base}"),
         };
         let pin = if pinned.contains(&m.snapshot_guid) {
             " [pinned]"

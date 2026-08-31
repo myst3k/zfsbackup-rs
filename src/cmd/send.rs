@@ -247,8 +247,10 @@ async fn send_stream(
                 Ok(this)
             });
             while inflight.len() >= a.parallel.max(1) {
-                let done = inflight.join_next().await.expect("non-empty joinset")??;
-                uploaded.insert(done);
+                let Some(r) = inflight.join_next().await else {
+                    break;
+                };
+                uploaded.insert(r??);
             }
         }
         seq += 1;

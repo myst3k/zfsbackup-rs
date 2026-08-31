@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use crate::manifest::{Manifest, keys};
 use crate::zfs::Zfs;
 
-use super::{Target, target};
+use super::target;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -34,17 +34,19 @@ pub async fn run(
 
     // Walk from_guid links back to the full.
     let mut chain: Vec<&Manifest> = vec![tip];
-    while let Some(from) = chain.last().expect("non-empty").from_guid {
+    let mut cur = tip;
+    while let Some(from) = cur.from_guid {
         let base = all
             .iter()
             .find(|m| m.snapshot_guid == from)
             .with_context(|| {
                 format!(
                     "chain is broken: base {from} of {} is not archived",
-                    chain.last().expect("non-empty").snapshot
+                    cur.snapshot
                 )
             })?;
         chain.push(base);
+        cur = base;
     }
     chain.reverse();
     println!(
