@@ -86,7 +86,16 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // Hold the snapshot while it is being read.
     let held = zfs.hold(&tags::hold(JOB), &a.snapshot).await?;
 
-    let result = send_stream(&t, &zfs, &a, &snap.dataset, snap.guid, from_name.clone()).await;
+    let result = send_stream(
+        &t,
+        &zfs,
+        &a,
+        &snap.dataset,
+        snap.guid,
+        from_name.clone(),
+        flags,
+    )
+    .await;
 
     // The hold's job is done once the stream is fully uploaded (or failed).
     if held && let Err(e) = zfs.release(&tags::hold(JOB), &a.snapshot).await {
@@ -160,6 +169,7 @@ async fn send_stream(
     dataset: &str,
     snap_guid: Guid,
     from_name: Option<String>,
+    flags: SendFlags,
 ) -> anyhow::Result<(Vec<Chunk>, u64, String, Option<String>, f64)> {
     let ds_guid = zfs.dataset(dataset).await?.guid;
     // Chunks from an interrupted earlier run: same key, same size → skip.
@@ -177,12 +187,7 @@ async fn send_stream(
         .send(&SendSpec {
             to: a.snapshot.clone(),
             from: from_name,
-            flags: SendFlags {
-                raw: false,
-                compressed: true,
-                large_blocks: true,
-                ..Default::default()
-            },
+            flags,
         })
         .await?;
     let mut stdout = proc.take_stdout();

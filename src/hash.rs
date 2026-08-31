@@ -218,13 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn cbor_roundtrip_is_binary() {
+    fn json_roundtrip_is_hex() {
         let b = Blake3([1u8; 32]);
-        let mut buf = Vec::new();
-        ciborium::into_writer(&b, &mut buf).unwrap();
-        // 32 bytes + 2-byte CBOR header, not 64 hex chars.
-        assert_eq!(buf.len(), 34);
-        let back: Blake3 = ciborium::from_reader(&buf[..]).unwrap();
+        let buf = serde_json::to_vec(&b).unwrap();
+        // 64 hex chars in quotes.
+        assert_eq!(buf.len(), 66);
+        let back: Blake3 = serde_json::from_slice(&buf).unwrap();
         assert_eq!(back, b);
     }
 }
