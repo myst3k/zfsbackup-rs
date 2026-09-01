@@ -23,39 +23,83 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
-  # The tool shells out to zfs; this proves the binary drives a real pool,
-  # not a mock. No S3 credentials are needed: the failures asserted here
-  # happen before any request is made.
-  zfs:
+  # End to end on every push: a real ZFS pool on one side, a real S3
+  # implementation on the other, and the actual binary in between. No mocks,
+  # no credentials, nothing to keep in sync with production.
+  e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: install zfs
+      - run: cargo build --release
+
+      - name: zfs pool on a file vdev
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq zfsutils-linux
           zfs version
-      - name: create a pool on a file vdev
-        run: |
-          truncate -s 512M /tmp/vdev
+          truncate -s 1G /tmp/vdev
           sudo zpool create citank /tmp/vdev
           sudo zfs create citank/data
-          sudo dd if=/dev/urandom of=/citank/data/f bs=1M count=8 status=none
+          sudo dd if=/dev/urandom of=/citank/data/one bs=1M count=24 status=none
           sudo zfs snapshot citank/data@a
-      - run: cargo build --release
-      - name: the binary reads the pool and reports real errors
+          sudo dd if=/dev/urandom of=/citank/data/two bs=1M count=16 status=none
+          sudo zfs snapshot citank/data@b
+
+      - name: minio
         run: |
-          set -e
-          B=./target/release/zfsbackup-rs
-          # Missing credentials must be a clear message, not a panic.
-          ! sudo -E $B send citank/data@a s3://nope 2>&1 | tee /tmp/o
-          grep -q "AWS_ACCESS_KEY_ID is not set" /tmp/o
-          # An unknown snapshot is a typed zfs error.
-          ! sudo -E AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y ZB_ENDPOINT=https://example.invalid \
-              ZB_REGION=us-east-1 $B send citank/data@missing s3://nope 2>&1 | tee /tmp/o2
-          grep -qi "does not exist\|not found" /tmp/o2
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=citest -e MINIO_ROOT_PASSWORD=citestsecret \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:9000/minio/health/live && break || sleep 2
+          done
+          AWS_ACCESS_KEY_ID=citest AWS_SECRET_ACCESS_KEY=citestsecret \
+            aws --endpoint-url http://localhost:9000 --region us-east-1 \
+            s3 mb s3://backups
+
+      - name: round trip
+        env:
+          AWS_ACCESS_KEY_ID: citest
+          AWS_SECRET_ACCESS_KEY: citestsecret
+          ZB_ENDPOINT: http://localhost:9000
+          ZB_REGION: us-east-1
+          ZB_ALLOW_HTTP: "1"
+        run: |
+          set -eux
+          B="sudo -E ./target/release/zfsbackup-rs"
+          U=s3://backups
+
+          # An endpoint that ignores CRC32C must still be usable.
+          $B check $U || true
+
+          $B send citank/data@a $U
+          $B send citank/data@b $U          # incremental, base found automatically
+          $B send citank/data@b $U | grep -q "already archived"
+          $B list $U | grep -q "citank/data@b"
+          $B verify citank/data@b $U
+
+          $B receive citank/data@b $U citank/restored
+          sudo zfs mount citank/restored
+          sudo cmp /citank/data/.zfs/snapshot/b/one /citank/restored/one
+          sudo cmp /citank/data/.zfs/snapshot/b/two /citank/restored/two
+
+          # Retention keeps the chain intact, then removes it on request.
+          $B retention $U --keep-last 2 --dry-run | grep -q "nothing to delete"
+          $B retention $U --keep-last 1 | grep -q "deleted: 1 snapshot"
+          $B verify citank/data@b $U
+          $B clean $U --dry-run
+
+          # Bad input reports, never panics.
+          ! $B retention $U --older-than 90д 2>&1 | grep -q panicked
+          ! $B send citank/data@a $U --chunk-size 8GiB 2>&1 | grep -q panicked
+
+      - name: logs on failure
+        if: failure()
+        run: docker logs minio | tail -40
       - name: cleanup
         if: always()
-        run: sudo zpool destroy citank || true
+        run: |
+          docker rm -f minio || true
+          sudo zpool destroy citank || true

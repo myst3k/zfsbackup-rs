@@ -10,6 +10,7 @@
 //! integrity check; BLAKE3 covers source → gateway.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -162,6 +163,10 @@ pub struct Store {
     /// Bucket-level calls `object_store` does not expose (ListMultipartUploads,
     /// checksummed UploadPart).
     admin: Option<Arc<admin::Admin>>,
+    /// Cleared the first time the endpoint ignores `x-amz-checksum-crc32c`,
+    /// so a store without that support is used plainly instead of failing
+    /// every upload. Shared across clones: the decision is per endpoint.
+    crc32c: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Store {
@@ -219,6 +224,7 @@ impl Store {
         Ok(Self {
             inner: Arc::new(s3),
             admin: Some(Arc::new(admin)),
+            crc32c: Arc::new(AtomicBool::new(true)),
             label: format!("s3://{}@{}", cfg.bucket, cfg.endpoint),
         })
     }
@@ -318,20 +324,31 @@ impl Store {
 
     #[instrument(skip(self, data), fields(store = %self.label, len = data.len()))]
     /// PUT with `x-amz-checksum-crc32c` so the store verifies the body at
-    /// write time. Plain put for stores without the admin client (memory).
-    /// PUT with `x-amz-checksum-crc32c` so the store verifies the body at
-    /// write time and refuses a corrupt upload. Endpoints that ignore the
-    /// header still get the bytes; `check` reports which kind you have.
+    /// write time and refuses a corrupt upload.
+    ///
+    /// Endpoints that ignore the header fall back to a plain PUT after the
+    /// first attempt, with one warning: the archive is still protected by the
+    /// BLAKE3 recorded per chunk, it is just checked on read rather than
+    /// refused on write. `check` reports which kind of endpoint you have.
     pub async fn put_verified(&self, key: &str, data: Bytes) -> Result<()> {
-        match &self.admin {
-            Some(a) => {
-                let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, &data) as u32;
-                a.put_object_crc32c(key, data, crc)
-                    .await
-                    .map_err(|e| admin_error(e, key, ""))
+        if let Some(a) = &self.admin
+            && self.crc32c.load(Ordering::Relaxed)
+        {
+            let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, &data) as u32;
+            match a.put_object_crc32c(key, data.clone(), crc).await {
+                Ok(()) => return Ok(()),
+                Err(admin::AdminError::S3 { code, .. }) if code == "ChecksumNotEchoed" => {
+                    self.crc32c.store(false, Ordering::Relaxed);
+                    warn!(
+                        store = %self.label,
+                        "endpoint does not verify CRC32C on upload; continuing with plain PUTs \
+                         (chunks are still BLAKE3-checked by verify and receive)"
+                    );
+                }
+                Err(e) => return Err(admin_error(e, key, "")),
             }
-            None => self.put(key, data).await,
         }
+        self.put(key, data).await
     }
 
     pub async fn put(&self, key: &str, data: Bytes) -> Result<()> {
