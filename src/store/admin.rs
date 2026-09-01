@@ -105,7 +105,7 @@ impl Admin {
             .use_rustls_tls()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(600))
-            .danger_accept_invalid_certs(crate::store::dev_allow_invalid_certs())
+            .danger_accept_invalid_certs(cfg.insecure_tls)
             .build()?;
         Ok(Self {
             http,

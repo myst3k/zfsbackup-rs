@@ -150,7 +150,7 @@ or `AWS_ENDPOINT_URL` / `AWS_REGION`.
 | Variable / flag | Effect |
 |---|---|
 | `--allow-http`, `ZB_ALLOW_HTTP=1` | Permit a plain `http://` endpoint. Credentials and data travel unencrypted — trusted networks only. |
-| `ZB_INSECURE_TLS=1` | Skip TLS certificate verification. Debugging only. |
+| `--insecure-tls`, `ZB_INSECURE_TLS=1` | Skip TLS certificate verification. Debugging only. |
 | `--zfs`, `ZB_ZFS` | Path to the `zfs` binary (default `zfs`). |
 | `RUST_LOG` | Log filter (`tracing_subscriber`), e.g. `RUST_LOG=debug`. |
 

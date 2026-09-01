@@ -24,6 +24,8 @@ pub struct Conn {
     pub region: Option<String>,
     /// Permit a plain-HTTP endpoint (a MinIO or Ceph on a trusted network).
     pub allow_http: bool,
+    /// Skip TLS certificate verification (debugging only).
+    pub insecure_tls: bool,
 }
 
 /// `s3://bucket` or `s3://bucket/prefix`.
@@ -64,6 +66,7 @@ pub fn target(uri: &str, c: &Conn) -> anyhow::Result<Target> {
         secret_access_key,
         path_style: true,
         allow_http: c.allow_http,
+        insecure_tls: c.insecure_tls,
         sha256_checksums: false,
 
         max_retries: 10,

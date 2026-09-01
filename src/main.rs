@@ -29,6 +29,10 @@ struct Cli {
     /// ZB_ALLOW_HTTP=1.
     #[arg(long, global = true)]
     allow_http: bool,
+    /// Skip TLS certificate verification (debugging only, e.g. behind an
+    /// intercepting proxy). Also settable as ZB_INSECURE_TLS=1.
+    #[arg(long, global = true)]
+    insecure_tls: bool,
     /// Path to the zfs binary.
     #[arg(long, env = "ZB_ZFS", default_value = "zfs", global = true)]
     zfs: String,
@@ -152,6 +156,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         endpoint: cli.endpoint.clone(),
         region: cli.region.clone(),
         allow_http: cli.allow_http || types::env_enabled("ZB_ALLOW_HTTP"),
+        insecure_tls: cli.insecure_tls || types::env_enabled("ZB_INSECURE_TLS"),
     };
     match cli.cmd {
         Cmd::Send {

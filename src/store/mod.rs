@@ -87,13 +87,6 @@ impl StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Development only: accept any TLS certificate from the object store, so a
-/// fault-injecting proxy can sit in front of a real endpoint. Never set in
-/// production; every store logs a warning when it is on.
-pub fn dev_allow_invalid_certs() -> bool {
-    crate::types::env_enabled("ZB_INSECURE_TLS")
-}
-
 /// S3's encoding of a CRC32C value: base64 of the big-endian 4 bytes.
 pub fn crc32c_b64(c: u32) -> String {
     use base64::Engine as _;
@@ -116,6 +109,9 @@ pub struct S3Config {
     /// Permit `http://` endpoints (local testing only).
     #[serde(default)]
     pub allow_http: bool,
+    /// Skip TLS certificate verification (debugging only).
+    #[serde(default)]
+    pub insecure_tls: bool,
     /// Send `x-amz-checksum-sha256` on uploads. Confirm the endpoint honours
     /// it before enabling in production.
     #[serde(default)]
@@ -182,11 +178,11 @@ impl Store {
             retry_timeout: Duration::from_secs(cfg.retry_timeout_secs),
             ..RetryConfig::default()
         };
-        let allow_invalid = dev_allow_invalid_certs();
+        let allow_invalid = cfg.insecure_tls;
         if allow_invalid {
             warn!(
                 endpoint = cfg.endpoint,
-                "ZB_INSECURE_TLS=1: TLS certificates are NOT verified (development only)"
+                "insecure TLS: certificates are NOT verified (--insecure-tls / ZB_INSECURE_TLS)"
             );
         }
         let client = ClientOptions::new()
