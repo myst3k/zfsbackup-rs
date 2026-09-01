@@ -6,10 +6,14 @@ works from object storage alone.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> **Status: early development.** The core workflow (send, receive, list,
-> verify, retention, pins) is implemented and exercised against real ZFS
-> pools and a real S3 provider (Wasabi), but the tool is young. Do not make
-> it the only copy of data you care about yet.
+> **Status: v0.1, pre-1.0.** Every command runs on each commit against a real
+> ZFS pool and a real S3 implementation, and the send → verify → restore path
+> is compared byte for byte. What it lacks is mileage: no production
+> deployments, no multi-terabyte runs, and coverage of Wasabi and MinIO rather
+> than every S3 implementation. Keep your existing backups in place alongside
+> it. The on-bucket layout is versioned (`zb/v1`); a breaking change bumps that
+> number, and a manifest from a newer version is refused rather than
+> misread.
 
 ## Why
 
@@ -145,8 +149,9 @@ ciphertext ever leaves the host.
 - Cheap remote audit: check stored checksums via `GetObjectAttributes`
   without downloading (today `verify` re-downloads everything — the
   strongest check, but it costs egress).
-- CI, static release binaries (x86-64 and arm64, musl), crates.io release.
-- Prune remaining ported-but-unused engine code.
+- A crates.io release, so `cargo install zfsbackup-rs` works without a git URL.
+- Parallel restore fetches sized from measured throughput rather than a fixed
+  window.
 
 ## License
 
