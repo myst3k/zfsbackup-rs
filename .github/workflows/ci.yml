@@ -85,11 +85,20 @@ jobs:
           sudo cmp /citank/data/.zfs/snapshot/b/one /citank/restored/one
           sudo cmp /citank/data/.zfs/snapshot/b/two /citank/restored/two
 
-          # Retention keeps the chain intact, then removes it on request.
-          $B retention $U --keep-last 2 --dry-run | grep -q "nothing to delete"
-          $B retention $U --keep-last 1 | grep -q "deleted: 1 snapshot"
-          $B verify citank/data@b $U
-          $B clean $U --dry-run
+          # Keeping the newest keeps the base it depends on: a chain of two
+          # under --keep-last 1 must delete nothing at all.
+          $B retention $U --keep-last 1 --dry-run | grep -q "nothing to delete"
+
+          # An independent full makes that chain expendable, and what
+          # survives must still restore.
+          sudo zfs snapshot citank/data@c
+          $B send citank/data@c $U --full
+          $B retention $U --keep-last 1 | grep -q "deleted: 2 snapshot"
+          ! $B list $U | grep -q "citank/data@a"
+          $B verify citank/data@c $U
+
+          # The deleted chain's chunks are gone, so there is nothing to collect.
+          $B clean $U --dry-run | grep -q "nothing to clean"
 
           # Bad input reports, never panics.
           ! $B retention $U --older-than 90д 2>&1 | grep -q panicked
