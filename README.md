@@ -38,11 +38,12 @@ so integrity can be audited from anywhere on a schedule.
 
 ## Install
 
-Static musl binaries for x86-64 and arm64 Linux are attached to each
-[release](https://github.com/myst3k/zfsbackup-rs/releases):
+Prebuilt Linux binaries for x86-64 and arm64 (dynamically linked against
+glibc 2.28+, so they run on any distro from roughly 2018 on) are attached to
+each [release](https://github.com/myst3k/zfsbackup-rs/releases):
 
 ```sh
-curl -fsSL https://github.com/myst3k/zfsbackup-rs/releases/latest/download/zfsbackup-rs-v0.1.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+curl -fsSL https://github.com/myst3k/zfsbackup-rs/releases/latest/download/zfsbackup-rs-v0.1.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
 sudo install -m755 zfsbackup-rs-*/zfsbackup-rs /usr/local/bin/
 ```
 
@@ -255,6 +256,14 @@ near two in flight and stops buffering data it can't consume.
 prefetch never holds more than ~512 MiB regardless of the sender's chunk size.
 Chunks are always applied in order, whichever download finishes first.
 
+### Verifying a backup
+
+`verify` reads back every chunk of a snapshot and recomputes its BLAKE3, then
+the whole-stream BLAKE3, checking both against the manifest. Because it hashes
+the actual bytes, it depends on nothing but the data itself — a mismatch means
+the stored chunk is corrupt. It needs no ZFS and no source pool, so it runs
+anywhere the bucket credentials reach; a full run reads the entire stream.
+
 ### Retention
 
 A snapshot survives if it falls within `--older-than`, ranks among the newest
@@ -286,10 +295,10 @@ cargo test                    # unit tests
 cargo clippy --all-targets    # lints (CI runs with -D warnings)
 ```
 
-CI runs fmt, clippy and tests, then an end-to-end job that creates a ZFS pool
-on a file vdev, starts a MinIO container, and drives the built binary through
-send → incremental → verify → receive (byte-compared) → retention → clean on
-every push. Tagging `v*` builds and publishes the release binaries.
+CI runs fmt, clippy, tests and a release build on every push. Full end-to-end
+runs (send → incremental → verify → receive with a byte-compare → retention →
+clean) are exercised against a real ZFS pool and an S3-compatible bucket
+outside CI. Tagging `v*` builds and publishes the release binaries.
 
 ## License
 
