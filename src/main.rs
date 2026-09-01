@@ -92,10 +92,23 @@ enum Cmd {
         #[arg(long)]
         older_than: Option<String>,
         /// Keep the newest N snapshots per dataset and delete the rest.
-        /// Combined with --older-than, both are kept.
+        /// Combined with --older-than, both are kept. 0 keeps none by count
+        /// and requires --older-than.
         #[arg(long)]
         keep_last: Option<usize>,
+        /// Limit the run to this dataset (trailing '*' matches a prefix).
+        /// Without it, every dataset in the bucket or prefix is in scope.
+        #[arg(long)]
+        dataset: Option<String>,
         /// Show what would be deleted without deleting.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove objects no backup refers to: abandoned sends and stray chunks.
+    Clean {
+        /// s3://bucket
+        uri: String,
+        /// Show what would be removed without removing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -165,18 +178,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             uri,
             older_than,
             keep_last,
+            dataset,
             dry_run,
         } => {
             cmd::retention::run(
                 &uri,
                 older_than.as_deref(),
                 keep_last,
+                dataset.as_deref(),
                 dry_run,
                 endpoint,
                 region,
             )
             .await
         }
+        Cmd::Clean { uri, dry_run } => cmd::clean::run(&uri, dry_run, endpoint, region).await,
         Cmd::Pin { snapshot, uri } => cmd::pin::run(&snapshot, &uri, true, endpoint, region).await,
         Cmd::Unpin { snapshot, uri } => {
             cmd::pin::run(&snapshot, &uri, false, endpoint, region).await

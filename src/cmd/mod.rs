@@ -1,5 +1,6 @@
 //! Command implementations.
 
+pub mod clean;
 pub mod list;
 pub mod pin;
 pub mod receive;

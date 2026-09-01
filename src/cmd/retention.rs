@@ -21,6 +21,7 @@ pub async fn run(
     uri: &str,
     older_than: Option<&str>,
     keep_last: Option<usize>,
+    dataset: Option<&str>,
     dry_run: bool,
     endpoint: Option<&str>,
     region: Option<&str>,
@@ -30,19 +31,47 @@ pub async fn run(
     if older_than.is_none() && keep_last.is_none() {
         bail!("give a policy: --older-than (e.g. 90d), --keep-last N, or both");
     }
-    let keep_last = keep_last.unwrap_or(1).max(1);
+    let keep_last = keep_last.unwrap_or(1);
+    if keep_last == 0 && older_than.is_none() {
+        bail!("--keep-last 0 with no --older-than would delete every backup; add an age policy");
+    }
     let t = target(uri, endpoint, region)?;
-    let all = t.manifests().await?;
+    let everything = t.manifests().await?;
+    // Scope first: in a shared bucket, one host's schedule must not prune
+    // another host's datasets. Chains never cross datasets, so narrowing
+    // here cannot orphan a base.
+    let all: Vec<Manifest> = match dataset {
+        None => everything,
+        Some(d) => {
+            let matches = |name: &str| match d.strip_suffix('*') {
+                Some(p) => name.starts_with(p),
+                None => name == d,
+            };
+            let v: Vec<Manifest> = everything
+                .into_iter()
+                .filter(|m| matches(&m.dataset))
+                .collect();
+            if v.is_empty() {
+                println!("no archived snapshots match {d}");
+                return Ok(());
+            }
+            v
+        }
+    };
     let pinned: HashSet<Guid> = t.pinned().await?.into_iter().collect();
     let cutoff = match older_than {
         Some(s) => Some(OffsetDateTime::now_utc() - parse_age(s)?),
         None => None,
     };
     println!(
-        "policy: keep the newest {keep_last} per dataset{}",
+        "policy: keep the newest {keep_last} per dataset{}{}",
         match older_than {
             Some(s) => format!(", plus anything newer than {s}"),
             None => String::new(),
+        },
+        match dataset {
+            Some(d) => format!(" (datasets matching {d})"),
+            None => " (all datasets in this bucket/prefix)".to_string(),
         }
     );
 
@@ -69,15 +98,33 @@ pub async fn run(
             continue;
         }
         // Manifest first: from this moment the backup is invisible.
+        //
+        // Plain deletes, one key at a time from the manifest's own chunk
+        // list. On a versioned bucket these leave delete markers, so the
+        // versioning an operator turned on as their undo still works;
+        // erasing every version is `clean`'s job, not a policy run's.
         t.store
             .delete(&keys::manifest(&t.prefix, m.dataset_guid, m.snapshot_guid))
             .await?;
-        let dir = format!(
-            "{}/",
-            keys::snapshot_dir(&t.prefix, m.dataset_guid, m.snapshot_guid)
-        );
-        let (objects, uploads) = t.store.purge_prefix(&dir).await?;
-        tracing::info!(snapshot = m.snapshot, objects, uploads, "chunks removed");
+        for c in &m.chunks {
+            t.store
+                .delete(&keys::chunk(
+                    &t.prefix,
+                    m.dataset_guid,
+                    m.snapshot_guid,
+                    c.seq,
+                ))
+                .await?;
+        }
+        // A marker can linger if the send that wrote it died.
+        if let Err(e) = t
+            .store
+            .delete(&keys::pending(&t.prefix, m.dataset_guid, m.snapshot_guid))
+            .await
+        {
+            tracing::debug!(error = %e, "no resume marker to remove");
+        }
+        tracing::info!(snapshot = m.snapshot, chunks = m.chunks.len(), "removed");
     }
     println!(
         "{}: {} snapshot(s), {} bytes{}",

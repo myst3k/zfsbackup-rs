@@ -86,8 +86,13 @@ A path after the bucket scopes everything to a prefix:
 | `receive <snap> <uri> <dataset>` | Restore the snapshot and everything it depends on into a dataset. `--force` passes `-F`, `--window` sets prefetch depth. |
 | `list <uri>` | Every archived snapshot, its kind (full / incremental + base), size, chunk count, pins. `--dataset` filters (trailing `*` for a prefix). |
 | `verify <snap> <uri>` | Download and re-hash every chunk; compare sizes, per-chunk BLAKE3 and whole-stream BLAKE3 against the manifest. Writes nothing. |
-| `retention <uri>` | Delete what `--older-than` and `--keep-last` allow — minus pins, minus anything a kept snapshot depends on. `--dry-run` prints the plan. |
+| `retention <uri>` | Delete what `--older-than` and `--keep-last` allow — minus pins, minus anything a kept snapshot depends on. `--dataset` limits the run to one dataset (trailing `*` matches a prefix); without it every dataset under the URI is in scope. `--dry-run` prints the plan. |
+| `clean <uri>` | Remove objects no backup refers to: chunks from a send that never committed a manifest, and strays beside a manifest that does not list them. A send still holding a live lease is left alone. `--dry-run` prints the plan. |
 | `pin` / `unpin <snap> <uri>` | Exempt a snapshot from retention. Pins are marker objects in the bucket. |
+
+`retention` deletes with plain DELETEs, so on a versioned bucket the previous
+versions stay available as your undo; `clean` is the command that erases what
+nothing references.
 
 Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`;
 endpoint and region from `--endpoint`/`--region`, `ZB_ENDPOINT`/`ZB_REGION`,
