@@ -19,7 +19,7 @@ use crate::stream::{Event, StreamParser};
 use crate::types::{Guid, SendFlags};
 use crate::zfs::{SendSpec, Zfs, tags};
 
-use super::{Target, retry, target};
+use super::{Conn, Target, retry, target};
 
 pub struct Args {
     pub snapshot: String,
@@ -28,8 +28,7 @@ pub struct Args {
     pub full: bool,
     pub chunk_size: u64,
     pub parallel: usize,
-    pub endpoint: Option<String>,
-    pub region: Option<String>,
+    pub conn: Conn,
     pub zfs_bin: String,
 }
 
@@ -48,7 +47,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     if a.chunk_size > MAX_CHUNK {
         bail!("chunk size must be at most 5GiB (a chunk is one PutObject, held in memory)");
     }
-    let t = target(&a.uri, a.endpoint.as_deref(), a.region.as_deref())?;
+    let t = target(&a.uri, &a.conn)?;
     let zfs = Zfs::new().with_binary(&a.zfs_bin);
     let snap = zfs.snapshot(&a.snapshot).await?;
     let ds = zfs.dataset(&snap.dataset).await?;
@@ -317,6 +316,15 @@ async fn send_stream(
             tracing::info!(seq, "chunk already uploaded; skipped");
             uploaded.insert(seq);
         } else {
+            // Make room *before* handing off, so the next chunk is read from
+            // the pipe while a full `parallel` uploads are in flight. Draining
+            // afterwards left one slot idle for the whole read.
+            while inflight.len() >= a.parallel.max(1) {
+                let Some(r) = inflight.join_next().await else {
+                    break;
+                };
+                uploaded.insert(r??);
+            }
             let store = t.store.clone();
             let data = Bytes::from(buf);
             let this = seq;
@@ -330,12 +338,6 @@ async fn send_stream(
                 .await?;
                 Ok(this)
             });
-            while inflight.len() >= a.parallel.max(1) {
-                let Some(r) = inflight.join_next().await else {
-                    break;
-                };
-                uploaded.insert(r??);
-            }
         }
         seq += 1;
     }

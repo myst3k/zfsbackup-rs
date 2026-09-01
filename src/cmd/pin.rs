@@ -6,16 +6,10 @@ use bytes::Bytes;
 
 use crate::manifest::keys;
 
-use super::target;
+use super::{Conn, target};
 
-pub async fn run(
-    snapshot: &str,
-    uri: &str,
-    pin: bool,
-    endpoint: Option<&str>,
-    region: Option<&str>,
-) -> anyhow::Result<()> {
-    let t = target(uri, endpoint, region)?;
+pub async fn run(snapshot: &str, uri: &str, pin: bool, conn: &Conn) -> anyhow::Result<()> {
+    let t = target(uri, conn)?;
     let m = t.manifest_for(snapshot).await?;
     let key = keys::pin(&t.prefix, m.snapshot_guid);
     if pin {

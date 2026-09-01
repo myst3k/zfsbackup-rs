@@ -1,14 +1,9 @@
 //! `list`: what the bucket holds, from manifests alone.
 
-use super::target;
+use super::{Conn, target};
 
-pub async fn run(
-    uri: &str,
-    dataset: Option<&str>,
-    endpoint: Option<&str>,
-    region: Option<&str>,
-) -> anyhow::Result<()> {
-    let t = target(uri, endpoint, region)?;
+pub async fn run(uri: &str, dataset: Option<&str>, conn: &Conn) -> anyhow::Result<()> {
+    let t = target(uri, conn)?;
     let manifests = t.manifests().await?;
     let pinned = t.pinned().await?;
     let matches = |name: &str| match dataset {

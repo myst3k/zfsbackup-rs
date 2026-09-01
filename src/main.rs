@@ -25,6 +25,10 @@ struct Cli {
     /// S3 region.
     #[arg(long, env = "ZB_REGION", global = true)]
     region: Option<String>,
+    /// Allow a plain-http:// endpoint (a MinIO or Ceph on a trusted
+    /// network). Credentials and data travel unencrypted.
+    #[arg(long, env = "ZB_ALLOW_HTTP", global = true)]
+    allow_http: bool,
     /// Path to the zfs binary.
     #[arg(long, env = "ZB_ZFS", default_value = "zfs", global = true)]
     zfs: String,
@@ -49,12 +53,14 @@ enum Cmd {
         /// Chunk size, e.g. 64MiB (min 5MiB).
         #[arg(long, default_value = "64MiB")]
         chunk_size: String,
-        /// Chunks uploaded in parallel. Memory use is roughly
-        /// chunk-size × parallel.
+        /// Chunks uploaded in parallel. Peak memory is roughly
+        /// chunk-size × (parallel + 1): the uploads in flight plus the one
+        /// being read from the pipe.
         #[arg(long, default_value_t = 4)]
         parallel: usize,
     },
     /// Restore a snapshot (and the chain it depends on) into a dataset.
+    /// The dataset is left unmounted; `zfs mount` it afterwards.
     Receive {
         /// pool/dataset@snapshot as recorded in the bucket
         snapshot: String,
@@ -65,7 +71,9 @@ enum Cmd {
         /// Pass -F to zfs receive (rollback/overwrite target).
         #[arg(long)]
         force: bool,
-        /// Chunks fetched ahead of the writer.
+        /// Chunks fetched ahead of the writer. Peak memory is roughly
+        /// window × the chunk size the backup was made with (shown when the
+        /// restore starts), so a big --chunk-size costs memory here too.
         #[arg(long, default_value_t = 4)]
         window: usize,
     },
@@ -134,8 +142,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let endpoint = cli.endpoint.as_deref();
-    let region = cli.region.as_deref();
+    let conn = cmd::Conn {
+        endpoint: cli.endpoint.clone(),
+        region: cli.region.clone(),
+        allow_http: cli.allow_http,
+    };
     match cli.cmd {
         Cmd::Send {
             snapshot,
@@ -152,8 +163,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 full,
                 chunk_size: types::parse_size(&chunk_size).map_err(anyhow::Error::msg)?,
                 parallel,
-                endpoint: cli.endpoint.clone(),
-                region: cli.region.clone(),
+                conn,
                 zfs_bin: cli.zfs.clone(),
             })
             .await
@@ -164,16 +174,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             target,
             force,
             window,
-        } => {
-            cmd::receive::run(
-                &snapshot, &uri, &target, force, window, endpoint, region, &cli.zfs,
-            )
-            .await
-        }
-        Cmd::List { uri, dataset } => {
-            cmd::list::run(&uri, dataset.as_deref(), endpoint, region).await
-        }
-        Cmd::Verify { snapshot, uri } => cmd::verify::run(&snapshot, &uri, endpoint, region).await,
+        } => cmd::receive::run(&snapshot, &uri, &target, force, window, &conn, &cli.zfs).await,
+        Cmd::List { uri, dataset } => cmd::list::run(&uri, dataset.as_deref(), &conn).await,
+        Cmd::Verify { snapshot, uri } => cmd::verify::run(&snapshot, &uri, &conn).await,
         Cmd::Retention {
             uri,
             older_than,
@@ -187,15 +190,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 keep_last,
                 dataset.as_deref(),
                 dry_run,
-                endpoint,
-                region,
+                &conn,
             )
             .await
         }
-        Cmd::Clean { uri, dry_run } => cmd::clean::run(&uri, dry_run, endpoint, region).await,
-        Cmd::Pin { snapshot, uri } => cmd::pin::run(&snapshot, &uri, true, endpoint, region).await,
-        Cmd::Unpin { snapshot, uri } => {
-            cmd::pin::run(&snapshot, &uri, false, endpoint, region).await
-        }
+        Cmd::Clean { uri, dry_run } => cmd::clean::run(&uri, dry_run, &conn).await,
+        Cmd::Pin { snapshot, uri } => cmd::pin::run(&snapshot, &uri, true, &conn).await,
+        Cmd::Unpin { snapshot, uri } => cmd::pin::run(&snapshot, &uri, false, &conn).await,
     }
 }

@@ -14,15 +14,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::{Manifest, Pending, keys};
 
-use super::target;
+use super::{Conn, target};
 
-pub async fn run(
-    uri: &str,
-    dry_run: bool,
-    endpoint: Option<&str>,
-    region: Option<&str>,
-) -> anyhow::Result<()> {
-    let t = target(uri, endpoint, region)?;
+pub async fn run(uri: &str, dry_run: bool, conn: &Conn) -> anyhow::Result<()> {
+    let t = target(uri, conn)?;
     let root = keys::all_manifests_prefix(&t.prefix);
 
     // Group every object by the snapshot directory it belongs to.

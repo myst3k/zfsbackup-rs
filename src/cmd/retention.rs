@@ -15,7 +15,7 @@ use time::{Duration, OffsetDateTime};
 use crate::manifest::{Manifest, keys};
 use crate::types::Guid;
 
-use super::target;
+use super::{Conn, target};
 
 pub async fn run(
     uri: &str,
@@ -23,8 +23,7 @@ pub async fn run(
     keep_last: Option<usize>,
     dataset: Option<&str>,
     dry_run: bool,
-    endpoint: Option<&str>,
-    region: Option<&str>,
+    conn: &Conn,
 ) -> anyhow::Result<()> {
     // Deleting backups is explicit work: one of the two policy flags must
     // say what to keep, so a bare `retention <uri>` can never delete.
@@ -35,7 +34,7 @@ pub async fn run(
     if keep_last == 0 && older_than.is_none() {
         bail!("--keep-last 0 with no --older-than would delete every backup; add an age policy");
     }
-    let t = target(uri, endpoint, region)?;
+    let t = target(uri, conn)?;
     let everything = t.manifests().await?;
     // Scope first: in a shared bucket, one host's schedule must not prune
     // another host's datasets. Chains never cross datasets, so narrowing

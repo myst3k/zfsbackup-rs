@@ -16,13 +16,23 @@ use crate::manifest::{Manifest, keys};
 use crate::store::{S3Config, Store};
 use crate::types::Guid;
 
+/// How to reach the store, shared by every command.
+#[derive(Clone, Debug, Default)]
+pub struct Conn {
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    /// Permit a plain-HTTP endpoint (a MinIO or Ceph on a trusted network).
+    pub allow_http: bool,
+}
+
 /// `s3://bucket` or `s3://bucket/prefix`.
 pub struct Target {
     pub store: Store,
     pub prefix: String,
 }
 
-pub fn target(uri: &str, endpoint: Option<&str>, region: Option<&str>) -> anyhow::Result<Target> {
+pub fn target(uri: &str, c: &Conn) -> anyhow::Result<Target> {
+    let (endpoint, region) = (c.endpoint.as_deref(), c.region.as_deref());
     let rest = uri
         .strip_prefix("s3://")
         .with_context(|| format!("{uri}: expected s3://bucket[/prefix]"))?;
@@ -52,7 +62,7 @@ pub fn target(uri: &str, endpoint: Option<&str>, region: Option<&str>) -> anyhow
         access_key_id,
         secret_access_key,
         path_style: true,
-        allow_http: false,
+        allow_http: c.allow_http,
         sha256_checksums: false,
         part_checksum: Default::default(),
         max_retries: 10,

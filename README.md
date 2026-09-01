@@ -83,7 +83,7 @@ A path after the bucket scopes everything to a prefix:
 | command | what it does |
 |---|---|
 | `send <snap> <uri>` | Archive one snapshot. `--from` picks an explicit base, `--full` forces a full, `--chunk-size`/`--parallel` tune the upload. Resumes an interrupted run. |
-| `receive <snap> <uri> <dataset>` | Restore the snapshot and everything it depends on into a dataset. `--force` passes `-F`, `--window` sets prefetch depth. |
+| `receive <snap> <uri> <dataset>` | Restore the snapshot and everything it depends on into a dataset, oldest stream first. The dataset is left **unmounted** (`zfs receive -u`, so no root is needed) — run `zfs mount <dataset>` afterwards. `--force` passes `-F`; `--window` sets prefetch depth, costing about `window x` the sender's chunk size in memory. |
 | `list <uri>` | Every archived snapshot, its kind (full / incremental + base), size, chunk count, pins. `--dataset` filters (trailing `*` for a prefix). |
 | `verify <snap> <uri>` | Download and re-hash every chunk; compare sizes, per-chunk BLAKE3 and whole-stream BLAKE3 against the manifest. Writes nothing. |
 | `retention <uri>` | Delete what `--older-than` and `--keep-last` allow — minus pins, minus anything a kept snapshot depends on. `--dataset` limits the run to one dataset (trailing `*` matches a prefix); without it every dataset under the URI is in scope. `--dry-run` prints the plan. |
@@ -97,6 +97,12 @@ nothing references.
 Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`;
 endpoint and region from `--endpoint`/`--region`, `ZB_ENDPOINT`/`ZB_REGION`,
 or `AWS_ENDPOINT_URL`/`AWS_REGION`.
+
+Two endpoint options exist for self-hosted stores, both off by default:
+`--allow-http` (or `ZB_ALLOW_HTTP=1`) permits a plain `http://` endpoint,
+and `ZB_INSECURE_TLS=1` skips TLS certificate verification. Each sends your
+credentials and data somewhere unauthenticated or unencrypted; use them only
+on a network you control, and never against a provider endpoint.
 
 ## How it is stored
 

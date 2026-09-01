@@ -5,15 +5,10 @@ use anyhow::bail;
 
 use crate::manifest::keys;
 
-use super::target;
+use super::{Conn, target};
 
-pub async fn run(
-    snapshot: &str,
-    uri: &str,
-    endpoint: Option<&str>,
-    region: Option<&str>,
-) -> anyhow::Result<()> {
-    let t = target(uri, endpoint, region)?;
+pub async fn run(snapshot: &str, uri: &str, conn: &Conn) -> anyhow::Result<()> {
+    let t = target(uri, conn)?;
     let m = t.manifest_for(snapshot).await?;
     let mut stream_hash = blake3::Hasher::new();
     let mut total = 0u64;

@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use crate::manifest::{Manifest, keys};
 use crate::zfs::Zfs;
 
-use super::target;
+use super::{Conn, target};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -20,11 +20,10 @@ pub async fn run(
     to: &str,
     force: bool,
     window: usize,
-    endpoint: Option<&str>,
-    region: Option<&str>,
+    conn: &Conn,
     zfs_bin: &str,
 ) -> anyhow::Result<()> {
-    let t = target(uri, endpoint, region)?;
+    let t = target(uri, conn)?;
     let zfs = Zfs::new().with_binary(zfs_bin);
     let all = t.manifests().await?;
     let tip_guid = super::pick(all.clone(), snapshot)?.snapshot_guid;
@@ -62,10 +61,21 @@ pub async fn run(
         cur = base;
     }
     chain.reverse();
+    // The chunk size is whatever the sender used; it, not a receive-side
+    // flag, sets how much memory `--window` costs here.
+    let chunk = chain
+        .iter()
+        .flat_map(|m| m.chunks.first())
+        .map(|c| c.bytes)
+        .max()
+        .unwrap_or(0);
     println!(
-        "restoring {} stream(s) into {to} ({} bytes total)",
+        "restoring {} stream(s) into {to} ({} bytes total; {} chunks of up to {:.0} MiB, {} prefetched)",
         chain.len(),
-        chain.iter().map(|m| m.bytes).sum::<u64>()
+        chain.iter().map(|m| m.bytes).sum::<u64>(),
+        chain.iter().map(|m| m.chunks.len()).sum::<usize>(),
+        chunk as f64 / 1_048_576.0,
+        window.max(1)
     );
 
     let started = std::time::Instant::now();
@@ -92,6 +102,9 @@ pub async fn run(
         secs,
         total as f64 / secs / 1e6
     );
+    // `zfs receive -u` keeps the dataset unmounted so the restore needs no
+    // root. Say so: an unmounted dataset looks exactly like an empty one.
+    println!("{to} is not mounted yet — `zfs mount {to}` (needs root)");
     Ok(())
 }
 
