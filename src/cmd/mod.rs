@@ -1,5 +1,6 @@
 //! Command implementations.
 
+pub mod check;
 pub mod clean;
 pub mod list;
 pub mod pin;
@@ -64,7 +65,7 @@ pub fn target(uri: &str, c: &Conn) -> anyhow::Result<Target> {
         path_style: true,
         allow_http: c.allow_http,
         sha256_checksums: false,
-        part_checksum: Default::default(),
+
         max_retries: 10,
         retry_timeout_secs: 300,
         request_timeout_secs: 900,
@@ -156,6 +157,37 @@ pub fn pick(all: Vec<Manifest>, snapshot: &str) -> anyhow::Result<Manifest> {
     }
 }
 
+/// Retry a fallible upload/download step with capped exponential backoff.
+///
+/// Store errors that say what went wrong — bad credentials, a missing
+/// bucket, a rejected checksum — are returned immediately; retrying those
+/// only delays the message the operator needs.
+pub async fn retry<T, F, Fut>(what: &str, mut op: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e)
+                if e.downcast_ref::<crate::store::StoreError>()
+                    .is_some_and(|s| !s.is_retryable()) =>
+            {
+                return Err(e.context(format!("{what}: not retryable")));
+            }
+            Err(e) if attempt < 6 => {
+                attempt += 1;
+                let wait = Duration::from_millis(300u64.saturating_mul(1 << attempt.min(5)));
+                tracing::warn!(what, attempt, error = %e, wait_ms = wait.as_millis() as u64, "retrying");
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => return Err(e.context(format!("{what}: giving up after {attempt} retries"))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::pick;
@@ -202,36 +234,5 @@ mod tests {
             e.contains(&Guid(1).to_string()) && e.contains(&Guid(2).to_string()),
             "{e}"
         );
-    }
-}
-
-/// Retry a fallible upload/download step with capped exponential backoff.
-///
-/// Store errors that say what went wrong — bad credentials, a missing
-/// bucket, a rejected checksum — are returned immediately; retrying those
-/// only delays the message the operator needs.
-pub async fn retry<T, F, Fut>(what: &str, mut op: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    let mut attempt = 0u32;
-    loop {
-        match op().await {
-            Ok(v) => return Ok(v),
-            Err(e)
-                if e.downcast_ref::<crate::store::StoreError>()
-                    .is_some_and(|s| !s.is_retryable()) =>
-            {
-                return Err(e.context(format!("{what}: not retryable")));
-            }
-            Err(e) if attempt < 6 => {
-                attempt += 1;
-                let wait = Duration::from_millis(300u64.saturating_mul(1 << attempt.min(5)));
-                tracing::warn!(what, attempt, error = %e, wait_ms = wait.as_millis() as u64, "retrying");
-                tokio::time::sleep(wait).await;
-            }
-            Err(e) => return Err(e.context(format!("{what}: giving up after {attempt} retries"))),
-        }
     }
 }

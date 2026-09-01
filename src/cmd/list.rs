@@ -15,8 +15,8 @@ pub async fn run(uri: &str, dataset: Option<&str>, conn: &Conn) -> anyhow::Resul
     };
     let mut shown = 0usize;
     println!(
-        "{:<40} {:>16} {:<12} {:>14} {:>7}  {}",
-        "SNAPSHOT", "GUID", "KIND", "BYTES", "CHUNKS", "CREATED"
+        "{:<40} {:>16} {:<12} {:>14} {:>7}  CREATED",
+        "SNAPSHOT", "GUID", "KIND", "BYTES", "CHUNKS"
     );
     for m in &manifests {
         if !matches(&m.dataset) {
@@ -35,7 +35,7 @@ pub async fn run(uri: &str, dataset: Option<&str>, conn: &Conn) -> anyhow::Resul
         println!(
             "{:<40} {:>16} {:<12} {:>14} {:>7}  {}{}",
             m.snapshot,
-            m.snapshot_guid.to_string(),
+            m.snapshot_guid,
             kind,
             m.bytes,
             m.chunks.len(),

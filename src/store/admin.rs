@@ -305,56 +305,6 @@ impl Admin {
         }
     }
 
-    /// UploadPart carrying `x-amz-checksum-crc32c`. The store verifies the
-    /// body against it (BadDigest on mismatch) and echoes it back, which we
-    /// check too. Returns the part's ETag. `part_number` is 1-based.
-    pub async fn upload_part_crc32c(
-        &self,
-        key: &str,
-        upload_id: &str,
-        part_number: u32,
-        data: Bytes,
-        crc: u32,
-    ) -> Result<String> {
-        let want = crate::store::crc32c_b64(crc);
-        let (_, headers, _) = self
-            .call_unsigned(
-                "UploadPart",
-                reqwest::Method::PUT,
-                Some(key),
-                &format!("partNumber={part_number}&uploadId={upload_id}"),
-                data,
-                &[
-                    ("x-amz-sdk-checksum-algorithm", "CRC32C".into()),
-                    ("x-amz-checksum-crc32c", want.clone()),
-                ],
-            )
-            .await?;
-        let echoed = headers
-            .get("x-amz-checksum-crc32c")
-            .and_then(|v| v.to_str().ok());
-        if echoed != Some(want.as_str()) {
-            return Err(AdminError::S3 {
-                op: "UploadPart",
-                status: 200,
-                code: "ChecksumNotEchoed".into(),
-                message: format!(
-                    "store returned checksum {echoed:?}, sent {want}; target does not verify CRC32C"
-                ),
-            });
-        }
-        headers
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| AdminError::S3 {
-                op: "UploadPart",
-                status: 200,
-                code: "NoETag".into(),
-                message: "UploadPart response had no ETag".into(),
-            })
-    }
-
     /// PUT one object carrying `x-amz-checksum-crc32c`: the store verifies
     /// the body server-side (BadDigest on mismatch) and echoes the checksum,
     /// which we check too.
@@ -384,53 +334,6 @@ impl Admin {
                 message: format!(
                     "store returned checksum {echoed:?}, sent {want}; target does not verify CRC32C"
                 ),
-            });
-        }
-        Ok(())
-    }
-
-    /// CompleteMultipartUpload listing each part's ETag and CRC32C.
-    pub async fn complete_multipart_crc32c(
-        &self,
-        key: &str,
-        upload_id: &str,
-        parts: &[crate::store::CompletedPart],
-    ) -> Result<()> {
-        let mut xml = String::from("<CompleteMultipartUpload>");
-        for (i, p) in parts.iter().enumerate() {
-            xml.push_str(&format!(
-                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag>",
-                i + 1,
-                p.etag
-            ));
-            if let Some(c) = p.crc32c {
-                xml.push_str(&format!(
-                    "<ChecksumCRC32C>{}</ChecksumCRC32C>",
-                    crate::store::crc32c_b64(c)
-                ));
-            }
-            xml.push_str("</Part>");
-        }
-        xml.push_str("</CompleteMultipartUpload>");
-        let (_, _, body) = self
-            .call_full(
-                "CompleteMultipartUpload",
-                reqwest::Method::POST,
-                Some(key),
-                &format!("uploadId={upload_id}"),
-                xml.into_bytes(),
-                &[],
-            )
-            .await?;
-        // S3 can answer 200 with an error document on Complete.
-        if let Some(code) = xml_tag(&body, "Code")
-            && xml_tag(&body, "ETag").is_none()
-        {
-            return Err(AdminError::S3 {
-                op: "CompleteMultipartUpload",
-                status: 200,
-                code,
-                message: xml_tag(&body, "Message").unwrap_or_default(),
             });
         }
         Ok(())
@@ -756,22 +659,6 @@ impl Admin {
         Ok(())
     }
 
-    /// Server-side copy of `key` from `src_bucket` (same endpoint and
-    /// credentials) into this bucket under the same key.
-    pub async fn copy_from(&self, src_bucket: &str, key: &str) -> Result<()> {
-        let src = format!("/{src_bucket}/{}", uri_encode(key, false));
-        self.call(
-            "CopyObject",
-            reqwest::Method::PUT,
-            Some(key),
-            "",
-            vec![],
-            &[("x-amz-copy-source", src)],
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Incomplete multipart uploads under `prefix`: (key, upload id).
     pub async fn list_multipart_uploads(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
@@ -822,26 +709,6 @@ impl Admin {
         }
     }
 
-    /// Create the bucket; `object_lock` also enables versioning (S3 semantics).
-    pub async fn create_bucket(&self, object_lock: bool) -> Result<()> {
-        let body = if self.cfg.region == "us-east-1" {
-            Vec::new()
-        } else {
-            format!(
-                "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>",
-                self.cfg.region
-            )
-            .into_bytes()
-        };
-        let mut hdrs = Vec::new();
-        if object_lock {
-            hdrs.push(("x-amz-bucket-object-lock-enabled", "true".to_string()));
-        }
-        self.call("CreateBucket", reqwest::Method::PUT, None, "", body, &hdrs)
-            .await?;
-        Ok(())
-    }
-
     /// "Enabled", "Suspended", or "Disabled" (never enabled).
     pub async fn versioning(&self) -> Result<String> {
         let (_, xml) = self
@@ -855,23 +722,6 @@ impl Admin {
             )
             .await?;
         Ok(xml_tag(&xml, "Status").unwrap_or_else(|| "Disabled".into()))
-    }
-
-    pub async fn set_versioning(&self, enabled: bool) -> Result<()> {
-        let body = format!(
-            "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>{}</Status></VersioningConfiguration>",
-            if enabled { "Enabled" } else { "Suspended" }
-        );
-        self.call(
-            "PutBucketVersioning",
-            reqwest::Method::PUT,
-            None,
-            "versioning=",
-            body.into_bytes(),
-            &[],
-        )
-        .await?;
-        Ok(())
     }
 
     /// (object lock enabled, default retention description)
@@ -926,30 +776,13 @@ impl Admin {
         }
     }
 
-    /// Install the recommended rule: abort incomplete multipart uploads after N days.
-    pub async fn set_lifecycle_abort_mpu(&self, days: u32) -> Result<()> {
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>snapshift-abort-incomplete-mpu</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>{days}</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"
-        );
-        let md5 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            md5::Md5::digest(body.as_bytes()),
-        );
-        self.call(
-            "PutBucketLifecycleConfiguration",
-            reqwest::Method::PUT,
-            None,
-            "lifecycle=",
-            body.into_bytes(),
-            &[("content-md5", md5)],
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Full validation: connectivity, credentials, bucket, versioning,
     /// Object Lock, lifecycle, and a write/read/delete/multipart probe.
-    pub async fn validate(&self, store: Option<&crate::store::Store>) -> Report {
+    pub async fn validate(
+        &self,
+        store: Option<&crate::store::Store>,
+        probe_prefix: &str,
+    ) -> Report {
         let mut r = Report {
             checked_at: time::OffsetDateTime::now_utc().to_string(),
             ..Default::default()
@@ -1023,8 +856,8 @@ impl Admin {
             Err(e) => r.warnings.push(format!("could not read lifecycle: {e}")),
         }
         if let Some(store) = store {
-            let key = format!("v1/.probe/{}", uuid::Uuid::now_v7());
-            let payload = bytes::Bytes::from_static(b"snapshift probe");
+            let key = format!("{probe_prefix}.probe/{}", uuid::Uuid::now_v7());
+            let payload = bytes::Bytes::from_static(b"zfsbackup-rs probe");
             match store.put(&key, payload.clone()).await {
                 Ok(()) => r.can_write = true,
                 Err(e) => r.errors.push(format!("probe write failed: {e}")),
@@ -1039,7 +872,7 @@ impl Admin {
                     Ok(()) => r.can_delete = true,
                     Err(e) => r.errors.push(format!("probe delete failed: {e}")),
                 }
-                let mkey = format!("v1/.probe/{}-mpu", uuid::Uuid::now_v7());
+                let mkey = format!("{probe_prefix}.probe/{}-mpu", uuid::Uuid::now_v7());
                 match store.create_multipart(&mkey).await {
                     Ok(id) => {
                         r.can_multipart = true;
@@ -1051,6 +884,27 @@ impl Admin {
                     Err(e) => r.errors.push(format!("multipart create failed: {e}")),
                 }
             }
+        }
+        // The claim that uploads are verified by the store is measured, not
+        // assumed: a part with a deliberately wrong checksum must be refused.
+        match self.probe_checksums().await {
+            Ok(p) => {
+                let ok = |x: &ChecksumProbeResult| {
+                    x.upload_part_accepted
+                        && x.upload_part_echoes_checksum == Some(true)
+                        && x.wrong_checksum_rejected == Some(true)
+                        && x.complete_accepted
+                };
+                r.crc32c_verified = Some(ok(&p.crc32c_composite));
+                r.crc64nvme_verified = Some(ok(&p.crc64nvme_full_object));
+                if r.crc32c_verified != Some(true) {
+                    r.warnings.push(
+                        "endpoint does not verify CRC32C on upload; corruption is caught on read instead of refused on write"
+                            .into(),
+                    );
+                }
+            }
+            Err(e) => r.warnings.push(format!("checksum probe failed: {e}")),
         }
         r.ok = r.errors.is_empty();
         r

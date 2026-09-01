@@ -142,10 +142,6 @@ pub mod keys {
         }
     }
 
-    pub fn dataset_dir(prefix: &str, dataset: Guid) -> String {
-        format!("{}/{dataset}", root(prefix))
-    }
-
     pub fn snapshot_dir(prefix: &str, dataset: Guid, snapshot: Guid) -> String {
         format!("{}/{dataset}/{snapshot}", root(prefix))
     }

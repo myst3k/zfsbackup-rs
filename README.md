@@ -44,7 +44,15 @@ rest, and verified again on its way out.
 
 ## Install
 
-Prebuilt static binaries are planned. Until then:
+Static binaries for x86-64 and arm64 Linux are attached to each
+[release](https://github.com/myst3k/zfsbackup-rs/releases):
+
+```sh
+curl -fsSL https://github.com/myst3k/zfsbackup-rs/releases/latest/download/zfsbackup-rs-v0.1.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+sudo install -m755 zfsbackup-rs-*/zfsbackup-rs /usr/local/bin/
+```
+
+Or build it yourself:
 
 ```sh
 cargo install --git https://github.com/myst3k/zfsbackup-rs
@@ -62,6 +70,7 @@ export ZB_REGION=us-east-2
 
 zfs snapshot tank/data@$(date -u +%Y%m%dT%H%M%SZ)
 
+zfsbackup-rs check s3://my-backups          # is this endpoint fit for backups?
 zfsbackup-rs send tank/data@20260831T120000Z s3://my-backups
 # first run: full. later runs: incremental from the newest archived base,
 # found automatically via snapshots or the bookmarks the tool maintains.
@@ -87,6 +96,7 @@ A path after the bucket scopes everything to a prefix:
 | `list <uri>` | Every archived snapshot, its kind (full / incremental + base), size, chunk count, pins. `--dataset` filters (trailing `*` for a prefix). |
 | `verify <snap> <uri>` | Download and re-hash every chunk; compare sizes, per-chunk BLAKE3 and whole-stream BLAKE3 against the manifest. Writes nothing. |
 | `retention <uri>` | Delete what `--older-than` and `--keep-last` allow — minus pins, minus anything a kept snapshot depends on. `--dataset` limits the run to one dataset (trailing `*` matches a prefix); without it every dataset under the URI is in scope. `--dry-run` prints the plan. |
+| `check <uri>` | Measure the endpoint before trusting it: credentials, bucket, versioning, Object Lock, lifecycle, a read/write/delete probe, and whether uploads are really checksum-verified (a part with a deliberately wrong CRC32C must be refused). |
 | `clean <uri>` | Remove objects no backup refers to: chunks from a send that never committed a manifest, and strays beside a manifest that does not list them. A send still holding a live lease is left alone. `--dry-run` prints the plan. |
 | `pin` / `unpin <snap> <uri>` | Exempt a snapshot from retention. Pins are marker objects in the bucket. |
 

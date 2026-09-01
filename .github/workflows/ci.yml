@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+
+  # The tool shells out to zfs; this proves the binary drives a real pool,
+  # not a mock. No S3 credentials are needed: the failures asserted here
+  # happen before any request is made.
+  zfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install zfs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zfsutils-linux
+          zfs version
+      - name: create a pool on a file vdev
+        run: |
+          truncate -s 512M /tmp/vdev
+          sudo zpool create citank /tmp/vdev
+          sudo zfs create citank/data
+          sudo dd if=/dev/urandom of=/citank/data/f bs=1M count=8 status=none
+          sudo zfs snapshot citank/data@a
+      - run: cargo build --release
+      - name: the binary reads the pool and reports real errors
+        run: |
+          set -e
+          B=./target/release/zfsbackup-rs
+          # Missing credentials must be a clear message, not a panic.
+          ! sudo -E $B send citank/data@a s3://nope 2>&1 | tee /tmp/o
+          grep -q "AWS_ACCESS_KEY_ID is not set" /tmp/o
+          # An unknown snapshot is a typed zfs error.
+          ! sudo -E AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y ZB_ENDPOINT=https://example.invalid \
+              ZB_REGION=us-east-1 $B send citank/data@missing s3://nope 2>&1 | tee /tmp/o2
+          grep -qi "does not exist\|not found" /tmp/o2
+      - name: cleanup
+        if: always()
+        run: sudo zpool destroy citank || true

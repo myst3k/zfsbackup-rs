@@ -7,7 +7,6 @@
 
 mod cmd;
 mod fletcher;
-mod hash;
 mod manifest;
 mod store;
 mod stream;
@@ -112,6 +111,12 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Check that an endpoint and bucket behave the way backups need:
+    /// credentials, versioning, and whether uploads are checksum-verified.
+    Check {
+        /// s3://bucket
+        uri: String,
+    },
     /// Remove objects no backup refers to: abandoned sends and stray chunks.
     Clean {
         /// s3://bucket
@@ -194,6 +199,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
+        Cmd::Check { uri } => cmd::check::run(&uri, &conn).await,
         Cmd::Clean { uri, dry_run } => cmd::clean::run(&uri, dry_run, &conn).await,
         Cmd::Pin { snapshot, uri } => cmd::pin::run(&snapshot, &uri, true, &conn).await,
         Cmd::Unpin { snapshot, uri } => cmd::pin::run(&snapshot, &uri, false, &conn).await,

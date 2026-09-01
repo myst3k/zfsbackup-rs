@@ -67,6 +67,10 @@ impl RecordType {
 
 /// `DMU_BACKUP_FEATURE_*` bits from `drr_versioninfo`.
 pub mod feature {
+    // The complete DMU_BACKUP_FEATURE_* table from the ZFS on-wire format.
+    // Only some bits are read today; the rest document the format and make
+    // an unknown-feature diagnosis possible.
+    #![allow(dead_code)]
     pub const DEDUP: u64 = 1 << 0;
     pub const DEDUPPROPS: u64 = 1 << 1;
     pub const SA_SPILL: u64 = 1 << 2;
@@ -84,6 +88,7 @@ pub mod feature {
     pub const SWITCH_TO_LARGE_BLOCKS: u64 = 1 << 27;
     pub const LONGNAME: u64 = 1 << 28;
 
+    #[cfg(test)]
     pub fn names(bits: u64) -> Vec<&'static str> {
         let table = [
             (DEDUP, "dedup"),
@@ -136,20 +141,13 @@ pub struct BeginHeader {
 }
 
 impl BeginHeader {
-    pub fn is_incremental(&self) -> bool {
-        self.from_guid.is_some()
-    }
+    #[cfg(test)]
     pub fn is_raw(&self) -> bool {
         self.features & feature::RAW != 0
     }
-    pub fn is_compressed(&self) -> bool {
-        self.features & (feature::COMPRESSED | feature::LZ4 | feature::ZSTD) != 0
-    }
+    #[cfg(test)]
     pub fn has_large_blocks(&self) -> bool {
         self.features & feature::LARGE_BLOCKS != 0
-    }
-    pub fn feature_names(&self) -> Vec<&'static str> {
-        feature::names(self.features)
     }
 }
 
@@ -244,11 +242,6 @@ impl StreamParser {
             ends: Vec::new(),
             finished: false,
         }
-    }
-
-    /// Running checksum so far (what the next END record should carry).
-    pub fn checksum(&self) -> Fletcher4 {
-        self.cksum
     }
 
     /// Feed the next slice of the stream. Returns events found in it.
@@ -485,6 +478,7 @@ impl StreamParser {
     }
 }
 
+#[cfg(test)]
 pub mod synth {
     //! Builds synthetic but checksum-correct streams. Used by tests and by
     //! the dev tooling (`fake-zfs`) on machines without ZFS.

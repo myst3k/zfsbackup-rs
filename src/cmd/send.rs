@@ -91,9 +91,26 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         large_blocks: true,
         ..Default::default()
     };
+    // `zfs send -nP` says how big the stream will be, so the run reports a
+    // size up front instead of only in hindsight.
+    let spec = SendSpec {
+        to: a.snapshot.clone(),
+        from: from_name.clone(),
+        flags,
+    };
+    let estimate = match zfs.estimate(&spec).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not estimate the stream size");
+            None
+        }
+    };
+    let size = estimate
+        .map(|n| format!(" (~{:.1} GiB)", n as f64 / 1_073_741_824.0))
+        .unwrap_or_default();
     match &from_name {
-        Some(f) => println!("incremental {} from {f}", a.snapshot),
-        None => println!("full {}", a.snapshot),
+        Some(f) => println!("incremental {} from {f}{size}", a.snapshot),
+        None => println!("full {}{size}", a.snapshot),
     }
 
     // Hold the snapshot while it is being read. The tag belongs to this tool,
@@ -105,7 +122,13 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // A signal ends the upload through the same path as an error, so the
     // hold below is always released.
     let result = tokio::select! {
-        r = send_stream(&t, &zfs, &a, &snap.dataset, snap.guid, from_name.clone(), from_guid, flags) => r,
+        r = send_stream(&t, &zfs, &a, StreamSpec {
+            dataset: snap.dataset.clone(),
+            snap_guid: snap.guid,
+            from_name: from_name.clone(),
+            from_guid,
+            flags,
+        }) => r,
         how = interrupted() => Err(anyhow::anyhow!("{how}; the partial upload can be resumed by re-running")),
     };
 
@@ -188,16 +211,30 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
 
 /// Read the stream, upload chunks (resuming past ones already present), and
 /// return (chunks, bytes, stream blake3, end checksum, seconds).
-async fn send_stream(
-    t: &Target,
-    zfs: &Zfs,
-    a: &Args,
-    dataset: &str,
+/// What identifies the stream being produced, as opposed to how it is
+/// uploaded (which lives in `Args`).
+struct StreamSpec {
+    dataset: String,
     snap_guid: Guid,
     from_name: Option<String>,
     from_guid: Option<Guid>,
     flags: SendFlags,
+}
+
+async fn send_stream(
+    t: &Target,
+    zfs: &Zfs,
+    a: &Args,
+    spec: StreamSpec,
 ) -> anyhow::Result<(Vec<Chunk>, u64, String, Option<String>, f64)> {
+    let StreamSpec {
+        dataset,
+        snap_guid,
+        from_name,
+        from_guid,
+        flags,
+    } = spec;
+    let dataset = dataset.as_str();
     let ds_guid = zfs.dataset(dataset).await?.guid;
     let dir = format!("{}/", keys::snapshot_dir(&t.prefix, ds_guid, snap_guid));
     let mut existing: BTreeMap<String, u64> = t.store.list(&dir).await?.into_iter().collect();

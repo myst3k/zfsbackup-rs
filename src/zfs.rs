@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::task::JoinHandle;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 #[derive(Debug, Error)]
 pub enum ZfsError {
@@ -132,11 +132,6 @@ impl SendProcess {
     pub async fn wait(mut self) -> Result<()> {
         wait_child(&mut self.child, self.stderr, "send").await
     }
-
-    /// Kill the process (used when the consumer aborts).
-    pub async fn kill(mut self) {
-        let _ = self.child.kill().await;
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -162,11 +157,6 @@ impl Zfs {
 
     pub fn with_binary(mut self, path: impl Into<PathBuf>) -> Self {
         self.binary = path.into();
-        self
-    }
-
-    pub fn with_timeout(mut self, t: Duration) -> Self {
-        self.timeout = t;
         self
     }
 
@@ -202,12 +192,6 @@ impl Zfs {
                 stderr,
             })
         }
-    }
-
-    pub async fn version(&self) -> Result<String> {
-        let out = self.run(&["version"]).await?;
-        // First line looks like `zfs-2.3.1-1`.
-        Ok(out.lines().next().unwrap_or("").trim().to_string())
     }
 
     pub async fn dataset(&self, name: &str) -> Result<Dataset> {
@@ -435,14 +419,6 @@ impl Zfs {
         }
     }
 
-    pub async fn holds(&self, snapshot: &str) -> Result<Vec<String>> {
-        let out = self.run(&["holds", "-H", snapshot]).await?;
-        Ok(out
-            .lines()
-            .filter_map(|l| l.split('\t').nth(1).map(str::to_string))
-            .collect())
-    }
-
     /// `zfs bookmark pool/ds@snap pool/ds#mark`; an existing bookmark is
     /// success. Bookmark names embed the snapshot GUID, so a name collision
     /// can only be the same snapshot. OpenZFS does not report EEXIST
@@ -528,31 +504,6 @@ impl Zfs {
             }
             Err(e) => Err(e),
         }
-    }
-
-    /// Feature flags enabled on a pool, for restore-target compatibility checks.
-    pub async fn pool_features(&self, pool: &str) -> Result<Vec<String>> {
-        let out = Command::new("zpool")
-            .args(["get", "-Hp", "-o", "property,value", "all", pool])
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| ZfsError::Spawn {
-                cmd: "zpool get".into(),
-                source: e,
-            })?;
-        if !out.status.success() {
-            warn!(pool, "zpool get failed");
-            return Ok(Vec::new());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| {
-                let (k, v) = l.split_once('\t')?;
-                let k = k.strip_prefix("feature@")?;
-                (v == "enabled" || v == "active").then(|| k.to_string())
-            })
-            .collect())
     }
 }
 
@@ -656,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_is_typed_error() {
         let z = Zfs::new().with_binary("/nonexistent/zfs");
-        let err = z.version().await.unwrap_err();
+        let err = z.dataset("tank").await.unwrap_err();
         assert!(matches!(err, ZfsError::Spawn { .. }), "{err}");
     }
 }

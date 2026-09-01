@@ -68,17 +68,26 @@ impl Fletcher4 {
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; 32] {
+    /// Read the 32-byte on-stream form back; inverse of `to_bytes`,
+    /// used by the roundtrip test.
+    #[cfg(test)]
+    pub fn from_bytes(b: &[u8; 32]) -> Self {
+        let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+        Self {
+            a: w(0),
+            b: w(1),
+            c: w(2),
+            d: w(3),
+        }
+    }
+
+    pub fn to_bytes(self) -> [u8; 32] {
         let mut out = [0u8; 32];
         out[0..8].copy_from_slice(&self.a.to_le_bytes());
         out[8..16].copy_from_slice(&self.b.to_le_bytes());
         out[16..24].copy_from_slice(&self.c.to_le_bytes());
         out[24..32].copy_from_slice(&self.d.to_le_bytes());
         out
-    }
-
-    pub fn from_bytes(b: &[u8; 32]) -> Self {
-        Self::from_stream_bytes(b, false)
     }
 }
 
