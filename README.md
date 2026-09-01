@@ -298,7 +298,8 @@ cargo clippy --all-targets    # lints (CI runs with -D warnings)
 CI runs fmt, clippy, tests and a release build on every push. Full end-to-end
 runs (send → incremental → verify → receive with a byte-compare → retention →
 clean) are exercised against a real ZFS pool and an S3-compatible bucket
-outside CI. Tagging `v*` builds and publishes the release binaries.
+outside CI. Release binaries are cross-built locally (glibc, pinned to 2.28)
+and attached to each GitHub release by hand.
 
 ## License
 
