@@ -1,54 +1,45 @@
 # zfsbackup-rs
 
-Back up `zfs send` streams to any S3-compatible object store. A single
-static binary that treats the bucket as the entire database — every command
-works from object storage alone.
+Back up ZFS snapshots to S3-compatible object storage. A single static
+binary that streams `zfs send` straight to a bucket, verifies every byte end
+to end, and manages incremental chains and retention with the bucket as the
+only source of truth — no server, no daemon, no database.
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![ci](https://github.com/myst3k/zfsbackup-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/myst3k/zfsbackup-rs/actions/workflows/ci.yml)
+[![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> **Status: v0.1, pre-1.0.** Every command runs on each commit against a real
-> ZFS pool and a real S3 implementation, and the send → verify → restore path
-> is compared byte for byte. What it lacks is mileage: no production
-> deployments, no multi-terabyte runs, and coverage of Wasabi and MinIO rather
-> than every S3 implementation. Keep your existing backups in place alongside
-> it. The on-bucket layout is versioned (`zb/v1`); a breaking change bumps that
-> number, and a manifest from a newer version is refused rather than
-> misread.
+> **v0.1.** CI exercises every command against a real ZFS pool and a real S3
+> store on each commit. No production mileage yet — keep your existing backups.
 
-## Why
+## Overview
 
-Integrity comes first: every byte is verified on its way in, provable at
-rest, and verified again on its way out.
+`zfsbackup-rs` archives ZFS snapshots to any S3-compatible store (AWS S3,
+Wasabi, MinIO, Ceph). It runs `zfs send`, splits the stream into fixed-size
+chunks, uploads them in parallel, and writes one JSON manifest per snapshot.
+Restores replay the chunks back into `zfs receive`. Everything else — listing
+backups, walking incremental chains, expiring old snapshots, garbage
+collection — is derived from the manifests in the bucket, so a bucket is a
+complete, self-describing backup: copy it and you have copied the backup
+system.
 
-- **Verified at every hop.**
-  1. While reading: every record's fletcher4 checksum in the `zfs send`
-     stream is verified as it flows.
-  2. In transit: every chunk is uploaded with `x-amz-checksum-crc32c`; the
-     store verifies the body server-side and refuses a mismatch, so a
-     corrupt upload cannot land.
-  3. At rest: the manifest records size and BLAKE3 for every chunk and for
-     the whole stream.
-  4. On restore: every chunk is BLAKE3-checked before a byte reaches
-     `zfs receive`, and ZFS then re-verifies its own stream checksums.
-- **`verify` without ZFS.** Re-download and re-hash any backup from any
-  machine with the credentials. Put it in cron and find bit rot
-  early, while a restore is still a drill.
-- **Chain-safe retention.** Expire by age and count; a full stays until
-  every incremental that depends on it, directly or transitively, is gone.
-  Pins exempt a snapshot and, through the rules, its whole ancestry.
-- **Crash-safe by construction.** The manifest is written last, so an
-  interrupted backup stays invisible; retention deletes the manifest first,
-  so every listed backup has all of its chunks. An interrupted send resumes
-  past chunks already uploaded.
-- **Zero staging.** Chunks stream straight from the `zfs send` pipe to the
-  store, keeping local disk out of the data path.
-- **Incrementals that survive snapshot rotation.** After each send the tool
-  leaves a bookmark; the base snapshot can be destroyed and future
-  incrementals still work.
+Integrity is enforced at every stage:
+
+- **Read** — the fletcher4 checksum ZFS embeds in each record is verified as
+  the stream is chunked, and the stream's END checksum is recorded.
+- **Write** — each chunk is uploaded with `x-amz-checksum-crc32c`, which the
+  store verifies server-side and rejects on mismatch. Stores that ignore the
+  header fall back to plain PUTs, with integrity then covered by the manifest.
+- **At rest** — the manifest records the size and BLAKE3 of every chunk and of
+  the whole stream.
+- **Restore** — each chunk is BLAKE3-checked before it reaches `zfs receive`,
+  and ZFS re-validates the stream on the way in.
+
+`verify` re-downloads and re-hashes a backup without ZFS or the source pool,
+so integrity can be audited from anywhere on a schedule.
 
 ## Install
 
-Static binaries for x86-64 and arm64 Linux are attached to each
+Static musl binaries for x86-64 and arm64 Linux are attached to each
 [release](https://github.com/myst3k/zfsbackup-rs/releases):
 
 ```sh
@@ -56,73 +47,56 @@ curl -fsSL https://github.com/myst3k/zfsbackup-rs/releases/latest/download/zfsba
 sudo install -m755 zfsbackup-rs-*/zfsbackup-rs /usr/local/bin/
 ```
 
-Or build it yourself:
+From source (Rust 1.85+, edition 2024):
 
 ```sh
 cargo install --git https://github.com/myst3k/zfsbackup-rs
 ```
 
-Requires a `zfs` binary on the host for `send`/`receive`; `list`, `verify`,
-`retention` and `pin` run anywhere.
+`send` and `receive` require the `zfs` binary and either root or the relevant
+`zfs allow` delegations. `list`, `verify`, `retention`, `check` and `clean`
+need only the S3 credentials and run anywhere.
 
-## Quick start
+## Usage
 
 ```sh
-export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
-export ZB_ENDPOINT=https://s3.us-east-2.wasabisys.com
-export ZB_REGION=us-east-2
+export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…
+export ZB_ENDPOINT=https://s3.us-east-2.wasabisys.com  ZB_REGION=us-east-2
+
+zfsbackup-rs check   s3://backups                          # validate the endpoint once
 
 zfs snapshot tank/data@$(date -u +%Y%m%dT%H%M%SZ)
+zfsbackup-rs send    tank/data@… s3://backups              # first run full, then incremental
 
-zfsbackup-rs check s3://my-backups          # is this endpoint fit for backups?
-zfsbackup-rs send tank/data@20260831T120000Z s3://my-backups
-# first run: full. later runs: incremental from the newest archived base,
-# found automatically via snapshots or the bookmarks the tool maintains.
-
-zfsbackup-rs list    s3://my-backups
-zfsbackup-rs verify  tank/data@20260831T120000Z s3://my-backups
-zfsbackup-rs receive tank/data@20260831T120000Z s3://my-backups pool2/restored
-# receives the full chain (full + intermediate incrementals), oldest first.
-
-zfsbackup-rs retention s3://my-backups --keep-last 30 --older-than 90d --dry-run
-zfsbackup-rs pin tank/data@20260831T120000Z s3://my-backups
+zfsbackup-rs list    s3://backups
+zfsbackup-rs verify  tank/data@… s3://backups
+zfsbackup-rs receive tank/data@… s3://backups tank/restore  # restores the whole chain
+zfsbackup-rs retention s3://backups --keep-last 30 --older-than 90d
 ```
 
-A path after the bucket scopes everything to a prefix:
-`s3://my-backups/hosts/alpha`.
+A path after the bucket confines everything to a prefix — give each host its
+own, e.g. `s3://backups/hosts/alpha`.
 
-## Commands
+### Commands
 
-| command | what it does |
+| Command | Description |
 |---|---|
-| `send <snap> <uri>` | Archive one snapshot. `--from` picks an explicit base, `--full` forces a full, `--chunk-size`/`--parallel` tune the upload. Resumes an interrupted run. |
-| `receive <snap> <uri> <dataset>` | Restore the snapshot and everything it depends on into a dataset, oldest stream first. The dataset is left **unmounted** (`zfs receive -u`, so no root is needed) — run `zfs mount <dataset>` afterwards. `--force` passes `-F`; `--window` sets prefetch depth, costing about `window x` the sender's chunk size in memory. |
-| `list <uri>` | Every archived snapshot, its kind (full / incremental + base), size, chunk count, pins. `--dataset` filters (trailing `*` for a prefix). |
-| `verify <snap> <uri>` | Download and re-hash every chunk; compare sizes, per-chunk BLAKE3 and whole-stream BLAKE3 against the manifest. Writes nothing. |
-| `retention <uri>` | Delete what `--older-than` and `--keep-last` allow — minus pins, minus anything a kept snapshot depends on. `--dataset` limits the run to one dataset (trailing `*` matches a prefix); without it every dataset under the URI is in scope. `--dry-run` prints the plan. |
-| `check <uri>` | Measure the endpoint before trusting it: credentials, bucket, versioning, Object Lock, lifecycle, a read/write/delete probe, and whether uploads are really checksum-verified (a part with a deliberately wrong CRC32C must be refused). |
-| `clean <uri>` | Remove objects no backup refers to: chunks from a send that never committed a manifest, and strays beside a manifest that does not list them. A send still holding a live lease is left alone. `--dry-run` prints the plan. |
-| `pin` / `unpin <snap> <uri>` | Exempt a snapshot from retention. Pins are marker objects in the bucket. |
+| `send <snap> <uri>` | Archive a snapshot. Selects the newest archived base for an incremental automatically; `--from` overrides it, `--full` forces a full. `--chunk-size` (default 64MiB, 5MiB–5GiB) and `--parallel` (default 4) tune throughput and memory. Interrupted sends resume. |
+| `receive <snap> <uri> <dataset>` | Restore the snapshot and the full chain it depends on, oldest first. The dataset is left unmounted (`zfs receive -u`); `zfs mount` it after. `--force` passes `-F`; `--window` sets prefetch depth. |
+| `list <uri>` | List archived snapshots with kind, size, chunk count and pins. `--dataset` filters (trailing `*` = prefix). |
+| `verify <snap> <uri>` | Re-download every chunk and check it against the manifest. Writes nothing; needs no ZFS. |
+| `retention <uri>` | Delete snapshots outside `--older-than` / `--keep-last`, never breaking a chain or touching pins. `--dataset` scopes the run; `--dry-run` shows the plan. |
+| `check <uri>` | Probe an endpoint: reachability, credentials, versioning, Object Lock, lifecycle, read/write/delete, and whether it actually verifies upload checksums. |
+| `clean <uri>` | Remove objects no manifest references — abandoned sends and strays. Skips sends holding a live lease. `--dry-run` shows the plan. |
+| `pin` / `unpin <snap> <uri>` | Exempt a snapshot (and its chain) from retention, or lift that. |
 
-`retention` deletes with plain DELETEs, so on a versioned bucket the previous
-versions stay available as your undo; `clean` is the command that erases what
-nothing references.
+Run `zfsbackup-rs <command> --help` for the full flag list.
 
-Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`;
-endpoint and region from `--endpoint`/`--region`, `ZB_ENDPOINT`/`ZB_REGION`,
-or `AWS_ENDPOINT_URL`/`AWS_REGION`.
+## How it works
 
-Two endpoint options exist for self-hosted stores, both off by default:
-`--allow-http` (or `ZB_ALLOW_HTTP=1`) permits a plain `http://` endpoint,
-and `ZB_INSECURE_TLS=1` skips TLS certificate verification. Each sends your
-credentials and data somewhere unauthenticated or unencrypted; use them only
-on a network you control, and never against a provider endpoint.
+### Bucket layout
 
-## How it is stored
-
-Keys are relative to the bucket (or to the prefix in
-`s3://bucket/prefix`): `zb/` namespaces everything the tool writes, so a
-bucket can hold other data alongside, and `v1/` versions the layout.
+Objects are written under a versioned, GUID-keyed prefix:
 
 ```text
 zb/v1/<dataset-guid>/<snapshot-guid>/manifest.json
@@ -130,31 +104,73 @@ zb/v1/<dataset-guid>/<snapshot-guid>/chunk-000000 … chunk-NNNNNN
 zb/v1/pins/<snapshot-guid>
 ```
 
-Keys are GUID-based, so renaming a dataset never orphans its history; human
-names live inside the manifests. Everything the tool knows is
-derivable from the bucket: copy the bucket and you have copied the whole
-backup system. Encrypted datasets are sent `--raw` automatically, so only
-ciphertext ever leaves the host.
+Keys use ZFS object GUIDs rather than names, so renaming a dataset never
+orphans its history; human-readable names live inside the manifests. The `zb/`
+prefix namespaces the tool's objects so a bucket can hold unrelated data, and
+`v1` versions the format — a manifest written by a newer, incompatible version
+is refused rather than misread.
 
-## Requirements
+The manifest is written **last**, after every chunk is uploaded, so its
+presence is the commit point: an interrupted `send` leaves only orphaned
+chunks (invisible to every command, reclaimable by `clean`), never a
+half-listed backup. `retention` deletes the manifest **first**, so a listed
+backup always has all of its chunks.
 
-- OpenZFS 2.x on hosts that run `send`/`receive`.
-- An S3-compatible store. Endpoints that verify `x-amz-checksum-crc32c`
-  (AWS S3, Wasabi, and others) give write-time verification; on endpoints
-  that do not, integrity still holds via the BLAKE3 manifest checks.
-- Enough snapshot/bookmark/hold delegation (`zfs allow`) or root on the host.
+### Incrementals
 
-## Roadmap
+After a successful send the tool leaves a ZFS bookmark, so the base snapshot
+can be destroyed locally and later incrementals still resolve. `send` picks a
+base from the most recent archived snapshot that still exists locally (as a
+snapshot or bookmark), ordered by archive time rather than pool-local
+`createtxg` so the choice survives a restore onto a different pool. `receive`
+walks the `from`-links back to the full and replays the chain in order,
+refusing one with a missing link.
 
-- Cheap remote audit: check stored checksums via `GetObjectAttributes`
-  without downloading (today `verify` re-downloads everything — the
-  strongest check, but it costs egress).
-- A crates.io release, so `cargo install zfsbackup-rs` works without a git URL.
-- Parallel restore fetches sized from measured throughput rather than a fixed
-  window.
+### Resume and concurrency
+
+A `send` writes a lease marker before uploading; a second send of the same
+snapshot sees a live lease and steps aside instead of corrupting the first.
+An interrupted send reuses chunks already uploaded when the next run produces
+an identical stream (same base, flags and chunk size), and starts clean
+otherwise.
+
+### Retention
+
+A snapshot survives if it falls within `--older-than`, ranks among the newest
+`--keep-last` of its dataset, is pinned, or is an ancestor of anything that
+survives. Deletions use plain S3 DELETEs, so on a versioned bucket the prior
+versions remain as an undo; erasing unreferenced objects outright is `clean`'s
+job.
+
+## Configuration
+
+Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Endpoint
+and region come from `--endpoint` / `--region`, `ZB_ENDPOINT` / `ZB_REGION`,
+or `AWS_ENDPOINT_URL` / `AWS_REGION`.
+
+| Variable / flag | Effect |
+|---|---|
+| `--allow-http`, `ZB_ALLOW_HTTP=1` | Permit a plain `http://` endpoint. Credentials and data travel unencrypted — trusted networks only. |
+| `ZB_INSECURE_TLS=1` | Skip TLS certificate verification. Debugging only. |
+| `--zfs`, `ZB_ZFS` | Path to the `zfs` binary (default `zfs`). |
+| `RUST_LOG` | Log filter (`tracing_subscriber`), e.g. `RUST_LOG=debug`. |
+
+Encrypted datasets are sent `--raw` automatically, so only ciphertext leaves
+the host.
+
+## Development
+
+```sh
+cargo test                    # unit tests
+cargo clippy --all-targets    # lints (CI runs with -D warnings)
+```
+
+CI runs fmt, clippy and tests, then an end-to-end job that creates a ZFS pool
+on a file vdev, starts a MinIO container, and drives the built binary through
+send → incremental → verify → receive (byte-compared) → retention → clean on
+every push. Tagging `v*` builds and publishes the release binaries.
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option. Contributions are welcome under
-the same terms.
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
+your option.
