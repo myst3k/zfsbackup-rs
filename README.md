@@ -60,87 +60,19 @@ need only the S3 credentials and run anywhere.
 
 Every command also accepts the global flags in [Configuration](#configuration)
 (`--endpoint`, `--region`, `--allow-http`, `--insecure-tls`, `--zfs`) and their
-environment equivalents. Only command-specific flags are listed below. Run
+environment equivalents; the table lists only command-specific flags. Run
 `zfsbackup-rs <command> --help` for the canonical reference.
 
-### `send <snapshot> <uri>`
-
-Archive one snapshot. With no base it sends a full stream; otherwise it selects
-the newest snapshot of this dataset already in the bucket as the incremental
-base. Runs `zfs send -c -L [--raw] [-i <base>]` under the hood (raw for
-encrypted datasets), splits the stream into chunks, uploads them, and commits
-a manifest. An interrupted run resumes from the chunks already uploaded.
-
-| Flag | Description |
-|---|---|
-| `--from <@snap\|#bookmark>` | Use an explicit incremental base instead of the automatic one. Must already be archived. |
-| `--full` | Force a full send even when a base exists. |
-| `--chunk-size <size>` | Chunk/upload part size, e.g. `64MiB`. Range 5MiB–5GiB (default `64MiB`). |
-| `--parallel <n>` | Chunks uploaded concurrently (default `4`). Peak memory ≈ `chunk-size × (parallel + 1)`. |
-
-### `receive <snapshot> <uri> <target>`
-
-Restore a snapshot and the whole incremental chain it depends on into `<target>`,
-oldest stream first, via `zfs receive -s -u`. Each chunk is BLAKE3-verified
-before it reaches ZFS. The target is left **unmounted**; run `zfs mount <target>`
-afterwards.
-
-| Flag | Description |
-|---|---|
-| `--force` | Pass `-F` to `zfs receive` (roll back / overwrite the target). |
-| `--window <n>` | Chunks prefetched ahead of the writer (default `4`). Peak memory ≈ `window ×` the sender's chunk size. |
-
-### `list <uri>`
-
-List archived snapshots — kind (full / incremental and its base), size, chunk
-count, and pins — read from the manifests alone.
-
-| Flag | Description |
-|---|---|
-| `--dataset <name>` | Show only this dataset; a trailing `*` matches a prefix. |
-
-### `verify <snapshot> <uri>`
-
-Re-download every chunk and check its size and BLAKE3, plus the whole-stream
-BLAKE3, against the manifest. Writes nothing and needs neither ZFS nor the
-source pool, so it runs anywhere on a schedule. No command-specific flags.
-
-### `retention <uri>`
-
-Delete snapshots that fall outside the policy, never breaking an incremental
-chain and never touching pins. Requires at least one of `--older-than` /
-`--keep-last`. Uses plain S3 DELETEs, so a versioned bucket keeps the prior
-versions.
-
-| Flag | Description |
-|---|---|
-| `--older-than <dur>` | Delete snapshots older than this, e.g. `90d`, `12w`, `24h`. Ancestors that a survivor needs are kept regardless. |
-| `--keep-last <n>` | Always keep the newest N per dataset. `0` (age policy required) keeps none by count. |
-| `--dataset <name>` | Limit the run to one dataset (trailing `*` = prefix). Default: every dataset under the URI. |
-| `--dry-run` | Print the deletion plan without deleting. |
-
-### `check <uri>`
-
-Probe an endpoint before trusting it: reachability, credentials, bucket,
-versioning, Object Lock, lifecycle, a read/write/delete round trip, and whether
-it truly verifies upload checksums (it uploads a deliberately wrong CRC32C and
-confirms the store rejects it). No command-specific flags.
-
-### `clean <uri>`
-
-Remove objects no manifest references — chunks from a send that never committed,
-and strays beside a manifest that does not list them. A send still holding a
-live lease is left alone.
-
-| Flag | Description |
-|---|---|
-| `--dry-run` | Print what would be removed without removing. |
-
-### `pin <snapshot> <uri>` / `unpin <snapshot> <uri>`
-
-Exempt a snapshot (and, through the retention rules, its whole ancestry) from
-deletion, or lift that. A pin is a marker object in the bucket. No
-command-specific flags.
+| Command | Description | Flags |
+|---|---|---|
+| `send <snapshot> <uri>` | Archive one snapshot. With no base it sends a full stream; otherwise it uses the newest already-archived snapshot of the dataset as the incremental base. Runs `zfs send -c -L [--raw] [-i <base>]`, chunks the stream, uploads it, and commits a manifest. Interrupted runs resume. | `--from <@snap\|#bookmark>` — explicit incremental base (must be archived)<br>`--full` — force a full even when a base exists<br>`--chunk-size <size>` — part size, 5MiB–5GiB (default `64MiB`)<br>`--parallel <n>` — concurrent chunks (default `4`); peak mem ≈ chunk-size × (n+1) |
+| `receive <snapshot> <uri> <target>` | Restore the snapshot and the whole chain it depends on into `<target>`, oldest first, via `zfs receive -s -u`. Each chunk is BLAKE3-verified before it reaches ZFS. Target is left **unmounted** — `zfs mount <target>` after. | `--force` — pass `-F` to `zfs receive` (roll back / overwrite)<br>`--window <n>` — chunks prefetched (default `4`); peak mem ≈ n × the sender's chunk size |
+| `list <uri>` | List archived snapshots — kind (full / incremental + base), size, chunk count, pins — from the manifests alone. | `--dataset <name>` — only this dataset (trailing `*` = prefix) |
+| `verify <snapshot> <uri>` | Re-download every chunk and check its size and BLAKE3, plus the whole-stream BLAKE3, against the manifest. Writes nothing; needs no ZFS or source pool. | *(none)* |
+| `retention <uri>` | Delete snapshots outside the policy, never breaking a chain or touching pins. Needs at least one of `--older-than` / `--keep-last`. Plain S3 DELETEs, so a versioned bucket keeps prior versions. | `--older-than <dur>` — delete older than e.g. `90d`, `12w`, `24h` (needed ancestors kept)<br>`--keep-last <n>` — keep newest N per dataset; `0` needs an age policy<br>`--dataset <name>` — scope to one dataset (trailing `*` = prefix)<br>`--dry-run` — print the plan, delete nothing |
+| `check <uri>` | Probe an endpoint before trusting it: reachability, credentials, bucket, versioning, Object Lock, lifecycle, a read/write/delete round trip, and whether it truly verifies upload checksums (uploads a deliberately wrong CRC32C and confirms it is rejected). | *(none)* |
+| `clean <uri>` | Remove objects no manifest references — chunks from a send that never committed, and strays beside a manifest. Sends holding a live lease are skipped. | `--dry-run` — print what would be removed, remove nothing |
+| `pin <snapshot> <uri>`<br>`unpin <snapshot> <uri>` | Exempt a snapshot (and, through the retention rules, its whole ancestry) from deletion, or lift that. A pin is a marker object in the bucket. | *(none)* |
 
 ## Usage
 
