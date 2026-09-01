@@ -25,8 +25,9 @@ struct Cli {
     #[arg(long, env = "ZB_REGION", global = true)]
     region: Option<String>,
     /// Allow a plain-http:// endpoint (a MinIO or Ceph on a trusted
-    /// network). Credentials and data travel unencrypted.
-    #[arg(long, env = "ZB_ALLOW_HTTP", global = true)]
+    /// network). Credentials and data travel unencrypted. Also settable as
+    /// ZB_ALLOW_HTTP=1.
+    #[arg(long, global = true)]
     allow_http: bool,
     /// Path to the zfs binary.
     #[arg(long, env = "ZB_ZFS", default_value = "zfs", global = true)]
@@ -150,7 +151,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let conn = cmd::Conn {
         endpoint: cli.endpoint.clone(),
         region: cli.region.clone(),
-        allow_http: cli.allow_http,
+        allow_http: cli.allow_http || types::env_enabled("ZB_ALLOW_HTTP"),
     };
     match cli.cmd {
         Cmd::Send {

@@ -91,7 +91,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// fault-injecting proxy can sit in front of a real endpoint. Never set in
 /// production; every store logs a warning when it is on.
 pub fn dev_allow_invalid_certs() -> bool {
-    std::env::var("ZB_INSECURE_TLS").is_ok_and(|v| v == "1")
+    crate::types::env_enabled("ZB_INSECURE_TLS")
 }
 
 /// S3's encoding of a CRC32C value: base64 of the big-endian 4 bytes.

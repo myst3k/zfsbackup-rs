@@ -177,3 +177,43 @@ mod tests {
         assert!(parse_size("17179869185G").is_err());
     }
 }
+
+/// Is this environment variable set to something a person means as "yes"?
+///
+/// `ZB_ALLOW_HTTP=1` and `ZB_ALLOW_HTTP=true` are the same intent; rejecting
+/// one of them is a papercut, and silently ignoring it would be worse.
+pub fn env_enabled(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::env_enabled;
+
+    #[test]
+    fn truthy_spellings() {
+        for (v, want) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            (" yes ", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("", false),
+            ("maybe", false),
+        ] {
+            unsafe { std::env::set_var("ZB_TEST_TOGGLE", v) };
+            assert_eq!(env_enabled("ZB_TEST_TOGGLE"), want, "{v:?}");
+        }
+        unsafe { std::env::remove_var("ZB_TEST_TOGGLE") };
+        assert!(!env_enabled("ZB_TEST_TOGGLE"));
+    }
+}
