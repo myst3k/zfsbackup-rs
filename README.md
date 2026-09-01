@@ -56,40 +56,176 @@ cargo install --git https://github.com/myst3k/zfsbackup-rs
 `zfs allow` delegations. `list`, `verify`, `retention`, `check` and `clean`
 need only the S3 credentials and run anywhere.
 
+## Commands
+
+Every command also accepts the global flags in [Configuration](#configuration)
+(`--endpoint`, `--region`, `--allow-http`, `--insecure-tls`, `--zfs`) and their
+environment equivalents. Only command-specific flags are listed below. Run
+`zfsbackup-rs <command> --help` for the canonical reference.
+
+### `send <snapshot> <uri>`
+
+Archive one snapshot. With no base it sends a full stream; otherwise it selects
+the newest snapshot of this dataset already in the bucket as the incremental
+base. Runs `zfs send -c -L [--raw] [-i <base>]` under the hood (raw for
+encrypted datasets), splits the stream into chunks, uploads them, and commits
+a manifest. An interrupted run resumes from the chunks already uploaded.
+
+| Flag | Description |
+|---|---|
+| `--from <@snap\|#bookmark>` | Use an explicit incremental base instead of the automatic one. Must already be archived. |
+| `--full` | Force a full send even when a base exists. |
+| `--chunk-size <size>` | Chunk/upload part size, e.g. `64MiB`. Range 5MiB–5GiB (default `64MiB`). |
+| `--parallel <n>` | Chunks uploaded concurrently (default `4`). Peak memory ≈ `chunk-size × (parallel + 1)`. |
+
+### `receive <snapshot> <uri> <target>`
+
+Restore a snapshot and the whole incremental chain it depends on into `<target>`,
+oldest stream first, via `zfs receive -s -u`. Each chunk is BLAKE3-verified
+before it reaches ZFS. The target is left **unmounted**; run `zfs mount <target>`
+afterwards.
+
+| Flag | Description |
+|---|---|
+| `--force` | Pass `-F` to `zfs receive` (roll back / overwrite the target). |
+| `--window <n>` | Chunks prefetched ahead of the writer (default `4`). Peak memory ≈ `window ×` the sender's chunk size. |
+
+### `list <uri>`
+
+List archived snapshots — kind (full / incremental and its base), size, chunk
+count, and pins — read from the manifests alone.
+
+| Flag | Description |
+|---|---|
+| `--dataset <name>` | Show only this dataset; a trailing `*` matches a prefix. |
+
+### `verify <snapshot> <uri>`
+
+Re-download every chunk and check its size and BLAKE3, plus the whole-stream
+BLAKE3, against the manifest. Writes nothing and needs neither ZFS nor the
+source pool, so it runs anywhere on a schedule. No command-specific flags.
+
+### `retention <uri>`
+
+Delete snapshots that fall outside the policy, never breaking an incremental
+chain and never touching pins. Requires at least one of `--older-than` /
+`--keep-last`. Uses plain S3 DELETEs, so a versioned bucket keeps the prior
+versions.
+
+| Flag | Description |
+|---|---|
+| `--older-than <dur>` | Delete snapshots older than this, e.g. `90d`, `12w`, `24h`. Ancestors that a survivor needs are kept regardless. |
+| `--keep-last <n>` | Always keep the newest N per dataset. `0` (age policy required) keeps none by count. |
+| `--dataset <name>` | Limit the run to one dataset (trailing `*` = prefix). Default: every dataset under the URI. |
+| `--dry-run` | Print the deletion plan without deleting. |
+
+### `check <uri>`
+
+Probe an endpoint before trusting it: reachability, credentials, bucket,
+versioning, Object Lock, lifecycle, a read/write/delete round trip, and whether
+it truly verifies upload checksums (it uploads a deliberately wrong CRC32C and
+confirms the store rejects it). No command-specific flags.
+
+### `clean <uri>`
+
+Remove objects no manifest references — chunks from a send that never committed,
+and strays beside a manifest that does not list them. A send still holding a
+live lease is left alone.
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Print what would be removed without removing. |
+
+### `pin <snapshot> <uri>` / `unpin <snapshot> <uri>`
+
+Exempt a snapshot (and, through the retention rules, its whole ancestry) from
+deletion, or lift that. A pin is a marker object in the bucket. No
+command-specific flags.
+
 ## Usage
+
+Set credentials and endpoint once (see [Configuration](#configuration) for all
+inputs):
 
 ```sh
 export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…
-export ZB_ENDPOINT=https://s3.us-east-2.wasabisys.com  ZB_REGION=us-east-2
+export ZB_ENDPOINT=https://s3.us-east-2.wasabisys.com
+export ZB_REGION=us-east-2
+```
 
-zfsbackup-rs check   s3://backups                          # validate the endpoint once
+**Confirm the bucket is fit for backups** — do this once per endpoint:
 
-zfs snapshot tank/data@$(date -u +%Y%m%dT%H%M%SZ)
-zfsbackup-rs send    tank/data@… s3://backups              # first run full, then incremental
+```sh
+zfsbackup-rs check s3://backups
+```
 
-zfsbackup-rs list    s3://backups
-zfsbackup-rs verify  tank/data@… s3://backups
-zfsbackup-rs receive tank/data@… s3://backups tank/restore  # restores the whole chain
+**First backup of a dataset** (a full stream). You take the snapshot; the tool
+sends it:
+
+```sh
+zfs snapshot tank/data@2026-09-01
+zfsbackup-rs send tank/data@2026-09-01 s3://backups
+# runs: zfs send -c -L tank/data@2026-09-01  → chunked → uploaded → manifest
+```
+
+**Later backups** (incremental from the previous one, chosen automatically):
+
+```sh
+zfs snapshot tank/data@2026-09-02
+zfsbackup-rs send tank/data@2026-09-02 s3://backups
+# runs: zfs send -c -L -i tank/data@2026-09-01 tank/data@2026-09-02
+```
+
+**Give each host its own prefix** so their datasets never collide:
+
+```sh
+zfsbackup-rs send tank/data@2026-09-02 s3://backups/hosts/alpha
+```
+
+**List and verify** what's stored (no ZFS required — run it from anywhere):
+
+```sh
+zfsbackup-rs list   s3://backups
+zfsbackup-rs verify tank/data@2026-09-02 s3://backups
+```
+
+**Restore** the snapshot and its full chain into a new dataset, then mount it:
+
+```sh
+zfsbackup-rs receive tank/data@2026-09-02 s3://backups tank/restore
+sudo zfs mount tank/restore
+# uses: zfs receive -s -u tank/restore   (unmounted; hence the explicit mount)
+```
+
+**Expire old backups** — keep the last 30 and anything under 90 days, chain-safe.
+Preview first:
+
+```sh
+zfsbackup-rs retention s3://backups --keep-last 30 --older-than 90d --dry-run
 zfsbackup-rs retention s3://backups --keep-last 30 --older-than 90d
 ```
 
-A path after the bucket confines everything to a prefix — give each host its
-own, e.g. `s3://backups/hosts/alpha`.
+**Protect a snapshot** from retention (e.g. a monthly you want to keep):
 
-### Commands
+```sh
+zfsbackup-rs pin tank/data@2026-09-01 s3://backups
+```
 
-| Command | Description |
-|---|---|
-| `send <snap> <uri>` | Archive a snapshot. Selects the newest archived base for an incremental automatically; `--from` overrides it, `--full` forces a full. `--chunk-size` (default 64MiB, 5MiB–5GiB) and `--parallel` (default 4) tune throughput and memory. Interrupted sends resume. |
-| `receive <snap> <uri> <dataset>` | Restore the snapshot and the full chain it depends on, oldest first. The dataset is left unmounted (`zfs receive -u`); `zfs mount` it after. `--force` passes `-F`; `--window` sets prefetch depth. |
-| `list <uri>` | List archived snapshots with kind, size, chunk count and pins. `--dataset` filters (trailing `*` = prefix). |
-| `verify <snap> <uri>` | Re-download every chunk and check it against the manifest. Writes nothing; needs no ZFS. |
-| `retention <uri>` | Delete snapshots outside `--older-than` / `--keep-last`, never breaking a chain or touching pins. `--dataset` scopes the run; `--dry-run` shows the plan. |
-| `check <uri>` | Probe an endpoint: reachability, credentials, versioning, Object Lock, lifecycle, read/write/delete, and whether it actually verifies upload checksums. |
-| `clean <uri>` | Remove objects no manifest references — abandoned sends and strays. Skips sends holding a live lease. `--dry-run` shows the plan. |
-| `pin` / `unpin <snap> <uri>` | Exempt a snapshot (and its chain) from retention, or lift that. |
+**Reclaim orphaned objects** left by interrupted sends:
 
-Run `zfsbackup-rs <command> --help` for the full flag list.
+```sh
+zfsbackup-rs clean s3://backups --dry-run
+zfsbackup-rs clean s3://backups
+```
+
+A typical cron entry — snapshot, back up incrementally, prune:
+
+```sh
+0 2 * * *  snap=tank/data@$(date -u +\%Y-\%m-\%dT\%H:\%M:\%SZ); \
+  zfs snapshot "$snap" && \
+  zfsbackup-rs send "$snap" s3://backups/hosts/alpha && \
+  zfsbackup-rs retention s3://backups/hosts/alpha --keep-last 30 --older-than 90d
+```
 
 ## How it works
 
