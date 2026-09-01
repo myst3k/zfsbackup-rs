@@ -170,11 +170,6 @@ pub mod keys {
     pub fn pins_prefix(prefix: &str) -> String {
         format!("{}/pins/", root(prefix))
     }
-
-    /// `true` for keys that are manifests.
-    pub fn is_manifest(key: &str) -> bool {
-        key.ends_with("/manifest.json")
-    }
 }
 
 #[cfg(test)]
@@ -193,8 +188,6 @@ mod tests {
             keys::chunk("backups", d, s, 7),
             "backups/zb/v1/0000000000000abc/0000000000000def/chunk-000007"
         );
-        assert!(keys::is_manifest(&keys::manifest("", d, s)));
-        assert!(!keys::is_manifest(&keys::chunk("", d, s, 0)));
     }
 
     #[test]

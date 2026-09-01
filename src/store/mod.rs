@@ -319,18 +319,18 @@ impl Store {
     // ---- whole objects ---------------------------------------------------
 
     #[instrument(skip(self, data), fields(store = %self.label, len = data.len()))]
-    /// PUT with `x-amz-checksum-crc32c` so the store verifies the body at
-    /// write time and refuses a corrupt upload.
+    /// PUT with `x-amz-checksum-crc32c` (the caller's precomputed CRC32C over
+    /// `data`) so the store verifies the body at write time and refuses a
+    /// corrupt upload.
     ///
     /// Endpoints that ignore the header fall back to a plain PUT after the
     /// first attempt, with one warning: the archive is still protected by the
     /// BLAKE3 recorded per chunk, it is just checked on read rather than
     /// refused on write. `check` reports which kind of endpoint you have.
-    pub async fn put_verified(&self, key: &str, data: Bytes) -> Result<()> {
+    pub async fn put_verified(&self, key: &str, data: Bytes, crc: u32) -> Result<()> {
         if let Some(a) = &self.admin
             && self.crc32c.load(Ordering::Relaxed)
         {
-            let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, &data) as u32;
             match a.put_object_crc32c(key, data.clone(), crc).await {
                 Ok(()) => return Ok(()),
                 Err(admin::AdminError::S3 { code, .. }) if code == "ChecksumNotEchoed" => {
@@ -384,6 +384,21 @@ impl Store {
             .try_collect()
             .await?;
         Ok(items)
+    }
+
+    /// Immediate sub-"directories" of a prefix — the S3 common prefixes under a
+    /// `/` delimiter — as full key strings without a trailing slash. Lists only
+    /// that one directory level and never the objects beneath it, so walking
+    /// the tree this way costs one request per directory instead of
+    /// enumerating every object under the prefix.
+    pub async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>> {
+        let p = Self::path(prefix);
+        let res = self.inner.list_with_delimiter(Some(&p)).await?;
+        Ok(res
+            .common_prefixes
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect())
     }
 }
 

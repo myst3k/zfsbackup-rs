@@ -166,19 +166,17 @@ fn keep_set(
             keep.insert(m.snapshot_guid);
         }
     }
-    loop {
-        let mut added = false;
-        for g in keep.clone() {
-            if let Some(m) = by_guid.get(&g)
-                && let Some(from) = m.from_guid
-                && by_guid.contains_key(&from)
-                && keep.insert(from)
-            {
-                added = true;
-            }
-        }
-        if !added {
-            break;
+    // Keep every ancestor a survivor depends on: walk back along from_guid
+    // from each kept snapshot. A worklist visits each guid once, so the keep
+    // set is never cloned.
+    let mut work: Vec<Guid> = keep.iter().copied().collect();
+    while let Some(g) = work.pop() {
+        if let Some(m) = by_guid.get(&g)
+            && let Some(from) = m.from_guid
+            && by_guid.contains_key(&from)
+            && keep.insert(from)
+        {
+            work.push(from);
         }
     }
     keep

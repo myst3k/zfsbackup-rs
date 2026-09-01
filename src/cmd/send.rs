@@ -172,7 +172,7 @@ pub async fn run(mut a: Args) -> anyhow::Result<()> {
     // hold below is always released.
     let result = tokio::select! {
         r = send_stream(&t, &zfs, &a, StreamSpec {
-            dataset: snap.dataset.clone(),
+            ds_guid: ds.guid,
             snap_guid: snap.guid,
             from_name: from_name.clone(),
             from_guid,
@@ -263,7 +263,7 @@ pub async fn run(mut a: Args) -> anyhow::Result<()> {
 /// What identifies the stream being produced, as opposed to how it is
 /// uploaded (which lives in `Args`).
 struct StreamSpec {
-    dataset: String,
+    ds_guid: Guid,
     snap_guid: Guid,
     from_name: Option<String>,
     from_guid: Option<Guid>,
@@ -277,14 +277,13 @@ async fn send_stream(
     spec: StreamSpec,
 ) -> anyhow::Result<(Vec<Chunk>, u64, String, Option<String>, f64)> {
     let StreamSpec {
-        dataset,
+        ds_guid,
         snap_guid,
         from_name,
         from_guid,
         flags,
     } = spec;
-    let dataset = dataset.as_str();
-    let ds_guid = zfs.dataset(dataset).await?.guid;
+    // ds_guid comes from run()'s earlier `zfs.dataset` call — no second lookup.
     let dir = format!("{}/", keys::snapshot_dir(&t.prefix, ds_guid, snap_guid));
     let mut existing: BTreeMap<String, u64> = t.store.list(&dir).await?.into_iter().collect();
 
@@ -366,15 +365,16 @@ async fn send_stream(
     let chunk_size = a.chunk_size as usize;
 
     loop {
-        // Fill one chunk from the pipe.
-        let mut buf = Vec::with_capacity(chunk_size);
+        // Fill one chunk from the pipe, reading straight into buf's reserved
+        // spare capacity — no per-read scratch buffer, no zero-fill, no second
+        // copy. On a multi-TB stream that removes a whole extra pass over every
+        // byte. read_buf writes into the uninitialized tail (Vec<u8>: BufMut)
+        // and grows the length by what it read.
+        let mut buf: Vec<u8> = Vec::with_capacity(chunk_size);
         while buf.len() < chunk_size {
-            let mut piece = vec![0u8; (chunk_size - buf.len()).min(1 << 20)];
-            let n = stdout.read(&mut piece).await?;
-            if n == 0 {
+            if stdout.read_buf(&mut buf).await? == 0 {
                 break;
             }
-            buf.extend_from_slice(&piece[..n]);
         }
         if buf.is_empty() {
             break;
@@ -393,6 +393,9 @@ async fn send_stream(
         }
         stream_hash.update_rayon(&buf);
         let blake3 = blake3::hash(&buf).to_hex().to_string();
+        // CRC32C over the chunk, computed once here and passed to the upload as
+        // the `x-amz-checksum-crc32c` write-time integrity header. Memory-speed.
+        let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, &buf) as u32;
         let bytes = buf.len() as u64;
         total += bytes;
         let key = keys::chunk(&t.prefix, ds_guid, snap_guid, seq);
@@ -419,7 +422,7 @@ async fn send_stream(
                     let store = store.clone();
                     let key = key.clone();
                     let data = data.clone();
-                    async move { Ok(store.put_verified(&key, data).await?) }
+                    async move { Ok(store.put_verified(&key, data, crc).await?) }
                 })
                 .await?;
                 Ok(this)

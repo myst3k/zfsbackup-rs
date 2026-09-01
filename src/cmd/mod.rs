@@ -12,6 +12,7 @@ pub mod verify;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use futures::stream::{StreamExt, TryStreamExt};
 
 use crate::manifest::{Manifest, keys};
 use crate::store::{S3Config, Store};
@@ -87,22 +88,44 @@ impl Target {
     /// walk while every command still reported success — and would let
     /// `retention` reason about chains it cannot see.
     pub async fn manifests(&self) -> anyhow::Result<Vec<Manifest>> {
-        let mut out = Vec::new();
-        for (key, _) in self
-            .store
-            .list(&keys::all_manifests_prefix(&self.prefix))
-            .await?
-        {
-            if !keys::is_manifest(&key) {
-                continue;
+        // Enumerate manifests without walking chunk objects. A hundred-TB
+        // dataset holds millions of chunk objects; a flat list of the whole
+        // prefix would return every one of them just to find the handful of
+        // manifest.json files. A delimited walk visits only dataset dirs and
+        // snapshot dirs, and each snapshot's manifest key is deterministic
+        // from there.
+        let root = keys::all_manifests_prefix(&self.prefix); // "…/zb/v1/"
+        let mut manifest_keys = Vec::new();
+        for ds_dir in self.store.list_dirs(&root).await? {
+            // `pins/` sits alongside the dataset dirs but holds flat marker
+            // objects, not snapshot subdirs, so it yields no manifest keys and
+            // needs no special case.
+            for snap_dir in self.store.list_dirs(&format!("{ds_dir}/")).await? {
+                manifest_keys.push(format!("{snap_dir}/manifest.json"));
             }
-            let bytes = self.store.get(&key).await?;
-            let m = Manifest::decode(&bytes)
-                .map_err(|e| anyhow::anyhow!("{key}: manifest is unreadable: {e}"))?;
-            m.check_version()
-                .map_err(|e| anyhow::anyhow!("{key}: {e}"))?;
-            out.push(m);
         }
+
+        // Fetch and decode in parallel. A snapshot dir that is mid-send has a
+        // pending marker but no manifest yet, so a missing manifest is skipped;
+        // an unreadable or wrong-version one fails the command (see above).
+        let fetched: Vec<Option<Manifest>> = futures::stream::iter(manifest_keys)
+            .map(|key| async move {
+                match self.store.get(&key).await {
+                    Ok(bytes) => {
+                        let m = Manifest::decode(&bytes)
+                            .map_err(|e| anyhow::anyhow!("{key}: manifest is unreadable: {e}"))?;
+                        m.check_version()
+                            .map_err(|e| anyhow::anyhow!("{key}: {e}"))?;
+                        Ok::<_, anyhow::Error>(Some(m))
+                    }
+                    Err(crate::store::StoreError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            })
+            .buffer_unordered(16)
+            .try_collect()
+            .await?;
+        let mut out: Vec<Manifest> = fetched.into_iter().flatten().collect();
         // Datasets together, then oldest first within each.
         out.sort_by(|a, b| {
             (a.dataset_guid, a.createtxg, a.snapshot_guid).cmp(&(
@@ -115,7 +138,8 @@ impl Target {
     }
 
     pub async fn manifest_for(&self, snapshot: &str) -> anyhow::Result<Manifest> {
-        pick(self.manifests().await?, snapshot)
+        let all = self.manifests().await?;
+        pick(&all, snapshot).cloned()
     }
 
     pub async fn pinned(&self) -> anyhow::Result<Vec<Guid>> {
@@ -135,11 +159,11 @@ impl Target {
 /// datasets — two hosts sharing a bucket, or a dataset recreated under the
 /// same name — while GUIDs do not, so an ambiguous name is an error naming
 /// the candidates rather than a silent pick.
-pub fn pick(all: Vec<Manifest>, snapshot: &str) -> anyhow::Result<Manifest> {
-    let mut hits: Vec<Manifest> = all.into_iter().filter(|m| m.snapshot == snapshot).collect();
+pub fn pick<'a>(all: &'a [Manifest], snapshot: &str) -> anyhow::Result<&'a Manifest> {
+    let hits: Vec<&Manifest> = all.iter().filter(|m| m.snapshot == snapshot).collect();
     match hits.len() {
         0 => bail!("{snapshot} is not archived here (see `list`)"),
-        1 => Ok(hits.remove(0)),
+        1 => Ok(hits[0]),
         _ => {
             let mut msg = format!("{snapshot} matches {} archived snapshots:\n", hits.len());
             for m in &hits {
@@ -218,12 +242,12 @@ mod tests {
     #[test]
     fn unique_name_resolves() {
         let all = vec![m(1, 10, "tank/data@a"), m(1, 11, "tank/data@b")];
-        assert_eq!(pick(all, "tank/data@b").unwrap().snapshot_guid, Guid(11));
+        assert_eq!(pick(&all, "tank/data@b").unwrap().snapshot_guid, Guid(11));
     }
 
     #[test]
     fn missing_name_errors() {
-        assert!(pick(vec![m(1, 10, "tank/data@a")], "tank/data@z").is_err());
+        assert!(pick(&[m(1, 10, "tank/data@a")], "tank/data@z").is_err());
     }
 
     /// Two hosts backing up the same dataset name into one bucket: the tool
@@ -231,7 +255,7 @@ mod tests {
     #[test]
     fn ambiguous_name_errors_with_candidates() {
         let all = vec![m(1, 10, "tank/data@daily"), m(2, 20, "tank/data@daily")];
-        let e = pick(all, "tank/data@daily").unwrap_err().to_string();
+        let e = pick(&all, "tank/data@daily").unwrap_err().to_string();
         assert!(e.contains("matches 2"), "{e}");
         assert!(
             e.contains(&Guid(1).to_string()) && e.contains(&Guid(2).to_string()),

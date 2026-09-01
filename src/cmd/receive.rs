@@ -50,7 +50,7 @@ pub async fn run(
     let t = target(uri, conn)?;
     let zfs = Zfs::new().with_binary(zfs_bin);
     let all = t.manifests().await?;
-    let tip_guid = super::pick(all.clone(), snapshot)?.snapshot_guid;
+    let tip_guid = super::pick(&all, snapshot)?.snapshot_guid;
     let tip = all
         .iter()
         .find(|m| m.snapshot_guid == tip_guid)

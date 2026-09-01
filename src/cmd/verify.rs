@@ -1,5 +1,8 @@
-//! `verify`: download every chunk of a snapshot and re-hash it. Writes
-//! nothing and needs no ZFS — run it anywhere with the credentials.
+//! `verify`: download every chunk of a snapshot and re-hash it against the
+//! manifest — per-chunk BLAKE3 and the whole-stream BLAKE3. It reads the bytes
+//! back and recomputes their hashes, so it depends on nothing but the data
+//! itself. Writes nothing and needs no ZFS or source pool: run it anywhere
+//! with the bucket credentials.
 
 use anyhow::bail;
 
