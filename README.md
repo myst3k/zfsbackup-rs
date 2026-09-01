@@ -8,8 +8,7 @@ only source of truth — no server, no daemon, no database.
 [![ci](https://github.com/myst3k/zfsbackup-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/myst3k/zfsbackup-rs/actions/workflows/ci.yml)
 [![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> **v0.1.** CI exercises every command against a real ZFS pool and a real S3
-> store on each commit. No production mileage yet — keep your existing backups.
+> **v0.1 — not yet battle-tested in production. Don't rely on it as your only backup.**
 
 ## Overview
 
