@@ -72,7 +72,7 @@ environment equivalents; the table lists only command-specific flags. Run
 | | `--parallel <n>` | Concurrent chunks (default `4`); peak memory ≈ chunk-size × (n+1). |
 | `receive <snapshot> <uri> <target>` | | Restore the snapshot and the whole chain it depends on into `<target>`, oldest first, via `zfs receive -s -u`. Each chunk is BLAKE3-verified before it reaches ZFS. The target is left unmounted — `zfs mount <target>` after. |
 | | `--force` | Pass `-F` to `zfs receive` (roll back / overwrite the target). |
-| | `--window <n>` | Chunks prefetched ahead of the writer (default `4`); peak memory ≈ n × the sender's chunk size. |
+| | `--window <n>` | Maximum chunks prefetched ahead of the writer (default `16`). Prefetch is adaptive and rarely reaches this; it's the ceiling, also capped so it never buffers more than ~512 MiB. |
 | `list <uri>` | | List archived snapshots — kind (full / incremental + base), size, chunk count, pins — from the manifests alone. |
 | | `--dataset <name>` | Only this dataset (trailing `*` matches a prefix). |
 | `verify <snapshot> <uri>` | | Re-download every chunk and check its size and BLAKE3, plus the whole-stream BLAKE3, against the manifest. Writes nothing; needs no ZFS or source pool. |
@@ -213,6 +213,22 @@ snapshot sees a live lease and steps aside instead of corrupting the first.
 An interrupted send reuses chunks already uploaded when the next run produces
 an identical stream (same base, flags and chunk size), and starts clean
 otherwise.
+
+### Adaptive restore prefetch
+
+`receive` reads chunks ahead of `zfs receive` so the pool never waits on the
+network, but the right amount of read-ahead depends on the link and the pool,
+and both vary. Rather than make you tune it, the prefetch depth adjusts itself:
+each time the writer needs the next chunk, the tool notes whether that chunk
+was already downloaded or the writer had to wait. If it had to wait, downloads
+are the bottleneck and it fetches one more chunk ahead; if the chunk was
+already sitting there, the pool is the bottleneck and it eases the depth back
+down. A fast link climbs toward the ceiling on its own; a slow writer settles
+near two in flight and stops buffering data it can't consume.
+
+`--window` is the ceiling (default 16), not a fixed depth, and it's capped so
+prefetch never holds more than ~512 MiB regardless of the sender's chunk size.
+Chunks are always applied in order, whichever download finishes first.
 
 ### Retention
 

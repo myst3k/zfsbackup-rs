@@ -75,10 +75,11 @@ enum Cmd {
         /// Pass -F to zfs receive (rollback/overwrite target).
         #[arg(long)]
         force: bool,
-        /// Chunks fetched ahead of the writer. Peak memory is roughly
-        /// window × the chunk size the backup was made with (shown when the
-        /// restore starts), so a big --chunk-size costs memory here too.
-        #[arg(long, default_value_t = 4)]
+        /// Maximum chunks prefetched ahead of the writer. Prefetch is
+        /// adaptive and rarely reaches this; it is the ceiling, and it is
+        /// capped so it never buffers more than ~512 MiB regardless of the
+        /// sender's chunk size.
+        #[arg(long, default_value_t = 16)]
         window: usize,
     },
     /// List archived snapshots.
