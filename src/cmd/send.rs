@@ -27,6 +27,12 @@ pub struct Args {
     pub from: Option<String>,
     pub full: bool,
     pub chunk_size: u64,
+    /// Choose the chunk size from the estimated stream size instead of using
+    /// `chunk_size`.
+    pub adaptive_chunk_size: bool,
+    /// Lower / upper bound for the adaptive size.
+    pub adaptive_chunk_min: u64,
+    pub adaptive_chunk_max: u64,
     pub parallel: usize,
     pub conn: Conn,
     pub zfs_bin: String,
@@ -40,12 +46,33 @@ const MAX_CHUNK: u64 = 5 << 30;
 /// How often the in-progress marker's lease is renewed while uploading.
 const LEASE_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub async fn run(a: Args) -> anyhow::Result<()> {
+/// Roughly how many chunks `--adaptive-chunk-size` aims for. Enough to keep
+/// uploads parallel and resume granular, few enough to keep the object count
+/// and manifest small.
+const ADAPTIVE_TARGET_CHUNKS: u64 = 1_000;
+
+/// Chunk size for a stream of `total` bytes: aim for ADAPTIVE_TARGET_CHUNKS,
+/// rounded up to a 16 MiB boundary, clamped to `[min, max]`.
+fn adaptive_chunk_size(total: u64, min: u64, max: u64) -> u64 {
+    let unit = 16 << 20;
+    let raw = (total / ADAPTIVE_TARGET_CHUNKS).clamp(min, max);
+    raw.div_ceil(unit).saturating_mul(unit).clamp(min, max)
+}
+
+pub async fn run(mut a: Args) -> anyhow::Result<()> {
     if a.chunk_size < MIN_CHUNK {
         bail!("chunk size must be at least 5MiB");
     }
     if a.chunk_size > MAX_CHUNK {
         bail!("chunk size must be at most 5GiB (a chunk is one PutObject, held in memory)");
+    }
+    if a.adaptive_chunk_size {
+        if a.adaptive_chunk_min < MIN_CHUNK || a.adaptive_chunk_max > MAX_CHUNK {
+            bail!("adaptive chunk bounds must be within 5MiB–5GiB");
+        }
+        if a.adaptive_chunk_min > a.adaptive_chunk_max {
+            bail!("--adaptive-chunk-min must not exceed --adaptive-chunk-max");
+        }
     }
     let t = target(&a.uri, &a.conn)?;
     let zfs = Zfs::new().with_binary(&a.zfs_bin);
@@ -111,6 +138,28 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     match &from_name {
         Some(f) => println!("incremental {} from {f}{size}", a.snapshot),
         None => println!("full {}{size}", a.snapshot),
+    }
+
+    // Size the chunk to the job when asked: too-small chunks on a huge stream
+    // mean needless round trips, too-large on a small one waste memory and
+    // parallelism. Needs the estimate; without it, keep the given size.
+    if a.adaptive_chunk_size {
+        match estimate {
+            Some(n) => {
+                a.chunk_size = adaptive_chunk_size(n, a.adaptive_chunk_min, a.adaptive_chunk_max);
+                println!(
+                    "adaptive chunk size: {} MiB (~{} chunks, bounds {}–{} MiB)",
+                    a.chunk_size / (1 << 20),
+                    n.div_ceil(a.chunk_size),
+                    a.adaptive_chunk_min / (1 << 20),
+                    a.adaptive_chunk_max / (1 << 20),
+                );
+            }
+            None => println!(
+                "adaptive chunk size: no estimate available, using {} MiB",
+                a.chunk_size / (1 << 20)
+            ),
+        }
     }
 
     // Hold the snapshot while it is being read. The tag belongs to this tool,
@@ -497,4 +546,37 @@ async fn auto_base(
     }
     println!("no archived base found locally; sending a full stream");
     Ok((None, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adaptive_chunk_size;
+
+    #[test]
+    fn adaptive_targets_a_sane_chunk_count() {
+        let gib = 1u64 << 30;
+        let mib = 1u64 << 20;
+        let (min, max) = (16 * mib, 512 * mib);
+
+        // Tiny stream clamps up to the floor; huge clamps to the ceiling.
+        assert_eq!(adaptive_chunk_size(100 * mib, min, max), min);
+        assert_eq!(adaptive_chunk_size(10 * 1024 * gib, min, max), max);
+
+        // Mid stream lands in range, on a 16 MiB boundary, near the target.
+        let c = adaptive_chunk_size(400 * gib, min, max);
+        assert!((min..=max).contains(&c));
+        assert_eq!(c % (16 * mib), 0);
+        let chunks = (400 * gib).div_ceil(c);
+        assert!((500..=2000).contains(&chunks), "got {chunks} chunks");
+    }
+
+    #[test]
+    fn adaptive_respects_custom_bounds() {
+        let gib = 1u64 << 30;
+        let tib = 1024 * gib;
+        // Hundreds of TB with a raised ceiling: chunks scale up to the max.
+        assert_eq!(adaptive_chunk_size(300 * tib, 64 << 20, 2 * gib), 2 * gib);
+        // A raised floor is honoured for a modest stream.
+        assert_eq!(adaptive_chunk_size(gib, 128 << 20, gib), 128 << 20);
+    }
 }

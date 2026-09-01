@@ -57,6 +57,16 @@ enum Cmd {
         /// Chunk size, e.g. 64MiB (min 5MiB).
         #[arg(long, default_value = "64MiB")]
         chunk_size: String,
+        /// Pick the chunk size from the estimated stream size (aims for ~1000
+        /// chunks), overriding --chunk-size.
+        #[arg(long)]
+        adaptive_chunk_size: bool,
+        /// Lower bound for --adaptive-chunk-size.
+        #[arg(long, default_value = "16MiB")]
+        adaptive_chunk_min: String,
+        /// Upper bound for --adaptive-chunk-size (raise for very large pools).
+        #[arg(long, default_value = "512MiB")]
+        adaptive_chunk_max: String,
         /// Chunks uploaded in parallel. Peak memory is roughly
         /// chunk-size × (parallel + 1): the uploads in flight plus the one
         /// being read from the pipe.
@@ -166,6 +176,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             from,
             full,
             chunk_size,
+            adaptive_chunk_size,
+            adaptive_chunk_min,
+            adaptive_chunk_max,
             parallel,
         } => {
             cmd::send::run(cmd::send::Args {
@@ -174,6 +187,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 from,
                 full,
                 chunk_size: types::parse_size(&chunk_size).map_err(anyhow::Error::msg)?,
+                adaptive_chunk_size,
+                adaptive_chunk_min: types::parse_size(&adaptive_chunk_min)
+                    .map_err(anyhow::Error::msg)?,
+                adaptive_chunk_max: types::parse_size(&adaptive_chunk_max)
+                    .map_err(anyhow::Error::msg)?,
                 parallel,
                 conn,
                 zfs_bin: cli.zfs.clone(),

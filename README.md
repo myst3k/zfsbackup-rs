@@ -69,6 +69,9 @@ environment equivalents; the table lists only command-specific flags. Run
 | | `--from <@snap\|#bookmark>` | Explicit incremental base (must be archived). |
 | | `--full` | Force a full send even when a base exists. |
 | | `--chunk-size <size>` | Part size, 5MiB–5GiB (default `64MiB`). |
+| | `--adaptive-chunk-size` | Pick the chunk size from the estimated stream size (aims for ~1000 chunks), overriding `--chunk-size`. |
+| | `--adaptive-chunk-min <size>` | Lower bound for adaptive sizing (default `16MiB`). |
+| | `--adaptive-chunk-max <size>` | Upper bound for adaptive sizing (default `512MiB`; raise for very large pools). |
 | | `--parallel <n>` | Concurrent chunks (default `4`); peak memory ≈ chunk-size × (n+1). |
 | `receive <snapshot> <uri> <target>` | | Restore the snapshot and the whole chain it depends on into `<target>`, oldest first, via `zfs receive -s -u`. Each chunk is BLAKE3-verified before it reaches ZFS. The target is left unmounted — `zfs mount <target>` after. |
 | | `--force` | Pass `-F` to `zfs receive` (roll back / overwrite the target). |
@@ -195,6 +198,28 @@ presence is the commit point: an interrupted `send` leaves only orphaned
 chunks (invisible to every command, reclaimable by `clean`), never a
 half-listed backup. `retention` deletes the manifest **first**, so a listed
 backup always has all of its chunks.
+
+### Choosing a chunk size
+
+Each chunk is one S3 object (one PutObject), so the trade-off is round trips
+and object count against memory and retry cost. Guidelines:
+
+- **Too small** — under ~16 MiB, the per-request overhead (a round trip and a
+  signature each) starts to dominate on a WAN, and the manifest and object
+  count grow.
+- **Too large** — memory is `chunk-size × (parallel + 1)` on send and up to the
+  prefetch budget on restore, a failed chunk re-uploads more, and an
+  interrupted send loses up to one chunk of progress.
+- **Sweet spot** — 64–256 MiB suits most datasets; 64 MiB (the default) is fine
+  up to a few hundred GB.
+
+`--adaptive-chunk-size` removes the guesswork: it reads the estimated stream
+size and picks a chunk size targeting ~1000 chunks, clamped to
+`--adaptive-chunk-min` / `--adaptive-chunk-max` (16 MiB–512 MiB by default). So
+a hundred-TB pool lands at the ceiling while a small incremental drops toward
+the floor, and the object count stays roughly constant either way. On very
+large pools, raise `--adaptive-chunk-max` (e.g. `1GiB`) and set `--parallel` so
+that `max × (parallel + 1)` fits the host's RAM.
 
 ### Incrementals
 
