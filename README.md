@@ -38,12 +38,11 @@ so integrity can be audited from anywhere on a schedule.
 
 ## Install
 
-Prebuilt Linux binaries for x86-64 and arm64 (dynamically linked against
-glibc 2.28+, so they run on any distro from roughly 2018 on) are attached to
-each [release](https://github.com/myst3k/zfsbackup-rs/releases):
+Prebuilt Linux binaries (amd64 and arm64) are attached to each
+[release](https://github.com/myst3k/zfsbackup-rs/releases):
 
 ```sh
-curl -fsSL https://github.com/myst3k/zfsbackup-rs/releases/latest/download/zfsbackup-rs-v0.1.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -fsSL https://github.com/myst3k/zfsbackup-rs/releases/latest/download/zfsbackup-rs-v0.1.0-linux-amd64.tar.gz | tar xz
 sudo install -m755 zfsbackup-rs-*/zfsbackup-rs /usr/local/bin/
 ```
 
